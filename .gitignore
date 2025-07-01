@@ -1,0 +1,66 @@
+# --- Python + uv gitignore ---
+
+## Virtual Environments (created by uv, venv, virtualenv, etc.)
+# This is the most important entry for uv projects
+/.venv/
+/venv/
+/env/
+/.env/
+
+## Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+## Linter and static analysis caches
+/.mypy_cache/
+/.ruff_cache/
+/.pytest_cache/
+
+## Distribution / Packaging
+/build/
+/dist/
+*.egg-info/
+*.egg
+/wheelhouse/
+
+## Secrets and local configuration files
+# Never commit secrets. Use environment variables or a vault.
+# Use an .env.example file to show required variables.
+*.env
+secrets.toml
+local_settings.py
+instance/
+.secret
+.secrets
+
+# Exception for example files
+!*.env.example
+
+## IDE / Editor specific files
+# VSCode
+/.vscode/
+# PyCharm
+/.idea/
+# Vim
+*.sw[a-p]
+
+## Testing artifacts
+htmlcov/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+pytest.xml
+
+## Jupyter Notebook
+.ipynb_checkpoints
+
+## Documentation
+# Sphinx documentation build directory
+/docs/_build/
+# MkDocs documentation build directory
+/site/
+
+*.jpg
