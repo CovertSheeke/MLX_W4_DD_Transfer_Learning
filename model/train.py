@@ -178,29 +178,45 @@ class VisionLanguageTrainer:
             'config': vars(self.config)
         }
         
-        # Save regular checkpoint
-        checkpoint_path = self.checkpoint_dir / f"checkpoint_step_{self.global_step}{suffix}.pt"
-        torch.save(checkpoint, checkpoint_path)
-        
-        # Save best model
+        # Only save and upload best models to save disk space
         if is_best:
             best_path = self.checkpoint_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
-            print(f"💾 Best model saved at step {self.global_step}")
+            print(f"💾 Best model saved at step {self.global_step} ({best_path.stat().st_size / 1e9:.1f}GB)")
             
             # Upload best model to wandb for remote backup
             if self.config.use_wandb and self.config.upload_checkpoints:
-                self.upload_checkpoint_to_wandb(best_path, f"best_model_step_{self.global_step}", is_best=True)
-        
-        # Upload latest checkpoint periodically for backup
-        if (self.config.use_wandb and self.config.upload_checkpoints and 
-            self.global_step % self.config.checkpoint_upload_freq == 0):
-            self.upload_checkpoint_to_wandb(checkpoint_path, f"checkpoint_step_{self.global_step}", is_best=False)
+                upload_success = self.upload_checkpoint_to_wandb(best_path, f"best_model_step_{self.global_step}", is_best=True)
+                
+                # Delete local checkpoint after successful upload to save space
+                if upload_success and self.config.delete_after_upload:
+                    best_path.unlink()
+                    print(f"🗑️  Deleted local checkpoint after successful upload")
             
-        # Keep only last N checkpoints to save space
-        self.cleanup_checkpoints()
-        
-        return checkpoint_path
+            return best_path
+        else:
+            # For non-best checkpoints, create temporary file, upload, then delete
+            temp_checkpoint_path = self.checkpoint_dir / f"temp_checkpoint_step_{self.global_step}.pt"
+            torch.save(checkpoint, temp_checkpoint_path)
+            
+            # Upload if it's time for periodic backup
+            if (self.config.use_wandb and self.config.upload_checkpoints and 
+                self.global_step % self.config.checkpoint_upload_freq == 0):
+                
+                print(f"💾 Temporary checkpoint saved ({temp_checkpoint_path.stat().st_size / 1e9:.1f}GB)")
+                upload_success = self.upload_checkpoint_to_wandb(temp_checkpoint_path, f"checkpoint_step_{self.global_step}", is_best=False)
+                
+                if upload_success:
+                    print(f"🗑️  Deleted temporary checkpoint after upload")
+                else:
+                    print(f"⚠️  Keeping temporary checkpoint due to upload failure")
+                    return temp_checkpoint_path
+            
+            # Always clean up temp file if not kept due to upload failure
+            if temp_checkpoint_path.exists():
+                temp_checkpoint_path.unlink()
+            
+            return None
     
     def upload_checkpoint_to_wandb(self, checkpoint_path, artifact_name, is_best=False):
         """Upload checkpoint to wandb as artifact."""
@@ -228,10 +244,12 @@ class VisionLanguageTrainer:
             # Log artifact to wandb
             wandb.log_artifact(artifact)
             print(f"✅ {'Best model' if is_best else 'Checkpoint'} uploaded successfully!")
+            return True
             
         except Exception as e:
             print(f"⚠️  Failed to upload checkpoint to wandb: {e}")
             # Don't fail training if upload fails
+            return False
         
     def cleanup_checkpoints(self, keep_last=1):
         """Remove old checkpoints to save disk space."""
@@ -317,13 +335,17 @@ class VisionLanguageTrainer:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 
-                # Check scale before optimizer step
-                scale_before = self.scaler.get_scale()
+                # Track optimizer step count to detect if step actually happened
+                optimizer_step_count_before = self.optimizer.state_dict().get('state', {}).get(next(iter(self.optimizer.param_groups[0]['params'])), {}).get('step', 0)
+                
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
+                # Check if optimizer actually stepped by comparing step counts
+                optimizer_step_count_after = self.optimizer.state_dict().get('state', {}).get(next(iter(self.optimizer.param_groups[0]['params'])), {}).get('step', 0)
+                
                 # Only step scheduler if optimizer actually stepped (no NaN/Inf gradients)
-                if self.scaler.get_scale() >= scale_before:
+                if optimizer_step_count_after > optimizer_step_count_before:
                     self.scheduler.step()
             else:
                 # Standard gradient clipping and optimizer step
@@ -334,7 +356,7 @@ class VisionLanguageTrainer:
             self.optimizer.zero_grad()
         
         return {
-            'loss': loss.item(),
+            'loss': loss.item() * self.config.gradient_accumulation_steps,  # Report unscaled loss for logging
             'lr': self.optimizer.param_groups[0]['lr'],
             'grad_norm': torch.nn.utils.clip_grad_norm_(self.model.parameters(), float('inf')).item()
         }
@@ -549,6 +571,8 @@ def parse_args():
                         help='Upload checkpoints to wandb as artifacts for remote backup')
     parser.add_argument('--checkpoint_upload_freq', type=int, default=2000,
                         help='Upload regular checkpoints every N steps (best models always uploaded)')
+    parser.add_argument('--delete_after_upload', action='store_true', default=True,
+                        help='Delete local checkpoints after successful upload to save disk space')
     
     # Resume training
     parser.add_argument('--resume_from_checkpoint', type=str, default=None)
