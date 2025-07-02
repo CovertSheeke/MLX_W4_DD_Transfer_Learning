@@ -183,46 +183,41 @@ class VisionLanguageTrainer:
         
         # Only save and upload best models to save disk space
         if is_best:
-            # Clean up previous upload if complete
-            upload_slot_available = self.cleanup_previous_upload()
-            
-            # Check if we should skip saving to avoid disk space issues
-            if not upload_slot_available and self.config.delete_after_upload:
-                print(f"⏳ Previous upload still in progress, skipping checkpoint save to avoid disk issues")
-                return None
-            
-            # Safe to save - either no previous file or upload slot is available
-            best_path = self.checkpoint_dir / "best_model.pt"
-            torch.save(checkpoint, best_path)
-            print(f"💾 Best model saved at step {self.global_step} ({best_path.stat().st_size / 1e9:.1f}GB)")
-            
-            # Only upload if: it's time (every 2000 steps) AND no upload in progress
+            # Check if we should actually save this best model
             should_upload = (self.config.use_wandb and self.config.upload_checkpoints and 
                            self.global_step % 2000 == 0)
             
             if should_upload:
+                # Clean up previous upload if complete
+                upload_slot_available = self.cleanup_previous_upload()
+                
+                # Check if we should skip saving to avoid disk space issues
+                if not upload_slot_available and self.config.delete_after_upload:
+                    print(f"⏳ Previous upload still in progress, skipping checkpoint save to avoid disk issues")
+                    return None
+                
+                # Safe to save and upload
+                best_path = self.checkpoint_dir / "best_model.pt"
+                torch.save(checkpoint, best_path)
+                print(f"💾 Best model saved at step {self.global_step} ({best_path.stat().st_size / 1e9:.1f}GB)")
+                
                 upload_success = self.upload_checkpoint_to_wandb(best_path, f"best_model_step_{self.global_step}", is_best=True)
                 
                 if upload_success:
                     # Track this file as currently uploading
                     self.current_upload_file = str(best_path)
                     print(f"✅ Upload queued successfully (tracking for completion)")
+                    return best_path
                 else:
                     print(f"⚠️  Upload failed, deleting local file to save disk space")
                     if self.config.delete_after_upload:
                         best_path.unlink()
                         print(f"🗑️  Deleted local checkpoint due to upload failure")
+                    return None
             else:
-                # Handle non-upload scenarios
-                if self.global_step % 2000 != 0:
-                    print(f"📝 Best model saved (will upload at next 2000-step interval)")
-                
-                # Delete non-uploading files to save space
-                if self.config.delete_after_upload:
-                    best_path.unlink()
-                    print(f"🗑️  Deleted local checkpoint (not uploading this step)")
-            
-            return best_path if best_path.exists() else None
+                # Not uploading this step - don't save to disk at all
+                print(f"🏆 Best model achieved at step {self.global_step} (will save at next 2000-step interval)")
+                return None
         else:
             # For non-best checkpoints, create temporary file, upload, then always delete
             temp_checkpoint_path = self.checkpoint_dir / f"temp_checkpoint_step_{self.global_step}.pt"
