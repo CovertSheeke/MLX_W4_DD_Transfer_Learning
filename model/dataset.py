@@ -8,6 +8,7 @@ import numpy as np
 import argparse
 from tqdm import tqdm
 
+
 def load_flickr_data(split='train'):
     ds = load_dataset("nlphuji/flickr30k", cache_dir='data/flickr_data', split=split)
     return ds
@@ -34,24 +35,162 @@ def create_dataset_splits(raw_dataset, train_ratio=0.9, val_ratio=0.1, seed=42):
     return splits
 
 
+class DatasetCacheError(Exception):
+    """Custom exception for dataset cache/download errors."""
+    pass
+
+
+class FlickrDatasetCache:
+    """Handles caching and downloading of preprocessed Flickr30k dataset files."""
+    
+    def __init__(self, cache_dir='data/flickr_processed', remote_repo=None, force_download=False):
+        """
+        Initialize the cache manager.
+        
+        Args:
+            cache_dir: Local directory to store cached files
+            remote_repo: Remote repository to download from (e.g., HF Hub repo name)
+            force_download: If True, always download fresh data (skip cache)
+        """
+        self.cache_dir = Path(cache_dir)
+        self.remote_repo = remote_repo
+        self.force_download = force_download
+        
+        # Define expected cache files
+        self.required_files = {
+            'images': self.cache_dir / 'img_data.parquet',
+            'train_captions': self.cache_dir / 'train_captions.parquet', 
+            'val_captions': self.cache_dir / 'val_captions.parquet'
+        }
+    
+    def cache_exists(self) -> bool:
+        """Check if all required cache files exist and are valid."""
+        if self.force_download:
+            return False
+            
+        # Check if all files exist
+        for file_type, file_path in self.required_files.items():
+            if not file_path.exists():
+                print(f"❌ Cache file missing: {file_path}")
+                return False
+                
+        # Basic validation - check if files are readable
+        try:
+            for file_type, file_path in self.required_files.items():
+                df = pd.read_parquet(file_path)
+                if len(df) == 0:
+                    print(f"❌ Cache file empty: {file_path}")
+                    return False
+            print("✅ Valid cache found")
+            return True
+        except Exception as e:
+            print(f"❌ Cache validation failed: {e}")
+            return False
+    
+    def download_from_remote(self):
+        """Download dataset files from remote repository."""
+        if not self.remote_repo:
+            raise DatasetCacheError(
+                "No cached data found and no remote_repo specified. "
+                "Either run preprocessing locally or provide a remote_repo."
+            )
+        
+        print(f"📥 Downloading from remote repository: {self.remote_repo}")
+        
+        try:
+            # Create cache directory
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Try HuggingFace Hub download
+            self._download_from_hf_hub()
+            
+        except Exception as e:
+            raise DatasetCacheError(f"Failed to download from remote repository: {e}")
+    
+    def _download_from_hf_hub(self):
+        """Download from HuggingFace Hub repository."""
+        try:
+            from huggingface_hub import snapshot_download
+            
+            print(f"Downloading from HuggingFace Hub: {self.remote_repo}")
+            snapshot_download(
+                repo_id=self.remote_repo,
+                repo_type="dataset",
+                local_dir=self.cache_dir,
+                local_dir_use_symlinks=False  # Copy files instead of symlinks
+            )
+            print("✅ Download completed")
+            
+        except ImportError:
+            raise DatasetCacheError(
+                "huggingface_hub not available. Install with: pip install huggingface_hub"
+            )
+        except Exception as e:
+            raise DatasetCacheError(f"HuggingFace Hub download failed: {e}")
+    
+    def ensure_data_available(self):
+        """
+        Ensure dataset files are available locally.
+        
+        This is the main method called by FlickrDataset.__init__().
+        It handles the cache/download logic transparently.
+        """
+        if not self.cache_exists():
+            if self.remote_repo:
+                print("📋 Cache not found, attempting download...")
+                self.download_from_remote()
+                
+                # Verify download worked
+                if not self.cache_exists():
+                    raise DatasetCacheError("Download completed but cache validation failed")
+            else:
+                raise DatasetCacheError(
+                    f"No cached data found in {self.cache_dir} and no remote_repo specified.\n"
+                    f"Please either:\n"
+                    f"  1. Run preprocessing: python dataset.py --preprocess\n"
+                    f"  2. Provide remote_repo parameter for download"
+                )
+        
+        print(f"📁 Using cached data from: {self.cache_dir}")
+    
+    def get_file_paths(self) -> dict:
+        """Return dictionary of file paths for the dataset."""
+        return self.required_files.copy()
+
 
 class FlickrDataset(Dataset):
-    def __init__(self, split='train'):
-        SAVE_DIR = Path('data', 'flickr_processed')
-        IMG_SAVE_FILE = Path(SAVE_DIR, 'img_data.parquet')
+    def __init__(self, split='train', remote_repo=None, cache_dir='data/flickr_processed', force_download=False):
+        """
+        Initialize Flickr30k dataset.
         
-        if split == 'train':
-            CAPTIONS_SAVE_FILE = Path(SAVE_DIR, 'train_captions.parquet')
-        elif split == 'validation':
-            CAPTIONS_SAVE_FILE = Path(SAVE_DIR, 'val_captions.parquet')
-        else:
+        Args:
+            split: Dataset split ('train' or 'validation')
+            remote_repo: Remote repository to download from if cache missing (e.g., 'username/repo-name')
+            cache_dir: Local cache directory
+            force_download: If True, always download fresh data
+        """
+        # Validate split
+        if split not in ['train', 'validation']:
             raise ValueError(f"Unsupported split: {split}. Use 'train' or 'validation'.")
+        
+        # Setup cache manager and ensure data is available
+        cache_manager = FlickrDatasetCache(cache_dir, remote_repo, force_download)
+        cache_manager.ensure_data_available()
+        
+        # Get file paths
+        file_paths = cache_manager.get_file_paths()
+        
+        # Determine caption file based on split
+        if split == 'train':
+            captions_file = file_paths['train_captions']
+        else:  # validation
+            captions_file = file_paths['val_captions']
             
-        # Load everything as numpy arrays
-        image_df = pd.read_parquet(IMG_SAVE_FILE)
-        captions_df = pd.read_parquet(CAPTIONS_SAVE_FILE)        
+        # Load data (same as before)
+        image_df = pd.read_parquet(file_paths['images'])
+        captions_df = pd.read_parquet(captions_file)        
 
-        # Save the length of the dataset
+        # Save dataset attributes
         self.length = len(captions_df)
         self.split = split
         self.image_data = image_df['image'].to_numpy()

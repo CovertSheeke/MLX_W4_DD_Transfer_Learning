@@ -28,6 +28,9 @@ class QwenModel(nn.Module):
         # Add projection layer to match dimensions
         self.image_projection = nn.Linear(1024, self.qwen.config.hidden_size)  # CLIP: 1024 -> Qwen: varies
         
+        # Add language modeling head to generate vocabulary logits
+        self.lm_head = nn.Linear(self.qwen.config.hidden_size, self.qwen.config.vocab_size, bias=False)
+        
         # Make models trainable
         for param in self.qwen.parameters():
             param.requires_grad = True
@@ -57,4 +60,8 @@ class QwenModel(nn.Module):
             attention_mask=combined_attention_mask
         )
         
-        return outputs
+        # Apply language modeling head to get vocabulary logits
+        hidden_states = outputs.last_hidden_state  # [batch, seq_len, hidden_size]
+        logits = self.lm_head(hidden_states)  # [batch, seq_len, vocab_size]
+        
+        return logits

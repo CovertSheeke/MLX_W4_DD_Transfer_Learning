@@ -58,10 +58,10 @@ class VisionLanguageTrainer:
         # Resize token embeddings if we added tokens
         self.model.qwen.resize_token_embeddings(len(self.tokenizer))
         
-        # Add language modeling head (don't create it dynamically in training)
+        # Update lm_head vocabulary size to match tokenizer (in case we added tokens)
         vocab_size = len(self.tokenizer)
-        hidden_size = self.model.qwen.config.hidden_size
-        self.model.lm_head = nn.Linear(hidden_size, vocab_size).to(self.device)
+        if self.model.lm_head.out_features != vocab_size:
+            self.model.lm_head = nn.Linear(self.model.qwen.config.hidden_size, vocab_size, bias=False).to(self.device)
         
         print(f"📊 Model loaded on {self.device}")
         print(f"📝 Tokenizer vocab size: {len(self.tokenizer)}")
@@ -70,9 +70,19 @@ class VisionLanguageTrainer:
         """Setup datasets and dataloaders."""
         print("📚 Setting up datasets...")
         
-        # Create datasets
-        self.train_dataset = FlickrDataset(split='train')
-        self.val_dataset = FlickrDataset(split='validation')
+        # Create datasets with cache/download configuration
+        self.train_dataset = FlickrDataset(
+            split='train',
+            remote_repo=self.config.remote_repo,
+            cache_dir=self.config.cache_dir,
+            force_download=self.config.force_download
+        )
+        self.val_dataset = FlickrDataset(
+            split='validation',
+            remote_repo=self.config.remote_repo,
+            cache_dir=self.config.cache_dir,
+            force_download=self.config.force_download
+        )
         
         print(f"📖 Train samples: {len(self.train_dataset)}")
         print(f"📖 Val samples: {len(self.val_dataset)}")
@@ -422,6 +432,12 @@ def parse_args():
     
     # Data arguments
     parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--cache_dir', type=str, default='data/flickr_processed', 
+                        help='Local cache directory for processed dataset')
+    parser.add_argument('--remote_repo', type=str, default=None,
+                        help='Remote repository to download dataset from (e.g., "username/repo-name")')
+    parser.add_argument('--force_download', action='store_true', 
+                        help='Force download fresh data even if cache exists')
     
     # Logging and checkpointing
     parser.add_argument('--use_wandb', action='store_true', default=True)
