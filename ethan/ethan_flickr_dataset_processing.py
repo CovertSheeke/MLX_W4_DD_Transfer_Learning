@@ -309,8 +309,8 @@ def main():
         "text_model": "roberta-base",
         "image_column": "image",
         "caption_column": "caption",
-        "max_samples": 50,  # Set to None for full dataset
-        "output_file": "flickr30k_processed_splits_test.pkl",
+        "max_samples": None,  # Set to None for full dataset
+        "output_file": "flickr30k_processed_splits.pkl",
         "device": "cpu"
     }
     
