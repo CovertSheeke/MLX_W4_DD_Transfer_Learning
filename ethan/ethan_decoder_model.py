@@ -15,9 +15,18 @@ class DecoderFull(nn.Module):
 
     def forward(self, x):
         # x is the concatenation of image and text embeddings
-        # add positional embedding
-        self.pos_ids = torch.arange(self.config.seq_len)
-        pos = self.pos_emb(self.pos_ids).unsqueeze(0)  # add batch dimension
+        # add positional embedding - use actual sequence length, not config
+        actual_seq_len = x.shape[1]  # Get actual sequence length from input
+        pos_ids = torch.arange(actual_seq_len, device=x.device)  # Use actual length
+        
+        print(f"pos_ids shape: {pos_ids.shape}")  # Debugging line
+        print('config seq_len:', self.config.seq_len)  # Debugging line
+        print('actual seq_len:', actual_seq_len)  # Debugging line
+        print('x shape:', x.shape)  # Debugging line
+
+        pos = self.pos_emb(pos_ids).unsqueeze(0)  # add batch dimension
+        print(f"pos shape: {pos.shape}")  # Debugging line
+        
         x = x + pos
 
         # run through the decoder blocks
@@ -34,7 +43,7 @@ class DecoderBlock(nn.Module):
         super().__init__()
         self.config = config
 
-        msAttnHeads = nn.ModuleList( msAttnHead(config) for _ in range(config.num_msAttnHeads))
+        self.msAttnHeads = nn.ModuleList( msAttnHead(config) for _ in range(config.num_msAttnHeads))
 
         self.norm1 = nn.LayerNorm(config.dim_attn_in)
 
@@ -86,7 +95,7 @@ class msAttnHead(nn.Module):
         a = self.dropout(a)
 
         # mask the upper triangular part of the attention matrix
-        mask = torch.triu(torch.ones(a.size(-2), a.size(-1)), diagonal=1).bool()
+        mask = torch.triu(torch.ones(a.size(-2), a.size(-1), device=x.device), diagonal=1).bool()
         a.masked_fill_(mask, float('-inf'))
 
         # Apply softmax to the attention scores
@@ -96,6 +105,6 @@ class msAttnHead(nn.Module):
         H_o = A @ V
         
         # Apply the linear layer to the output of the attention head to bring back to embedding dimension
-        return H_o @ self.W_up
+        return self.W_up(H_o)
 
         

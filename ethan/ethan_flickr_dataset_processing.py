@@ -25,7 +25,7 @@ class EmbeddingProcessor:
         self,
         vision_model_name: str = "openai/clip-vit-base-patch32",
         text_model_name: str = "roberta-base",
-        device: str = "cpu"
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.device = device
         self.vision_model_name = vision_model_name
@@ -76,8 +76,8 @@ class EmbeddingProcessor:
         
         return embeddings.cpu()
     
-    def embed_text(self, text: str, return_targets: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Generate embeddings for text with optional autoregressive targets."""
+    def embed_text(self, text: str, return_targets: bool = False) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Generate embeddings and tokens for text with optional autoregressive targets."""
         inputs = self.text_tokenizer(text, return_tensors="pt", add_special_tokens=True).to(self.device)
         input_ids = inputs["input_ids"].squeeze(0)
         
@@ -89,9 +89,10 @@ class EmbeddingProcessor:
             # Prepare for autoregressive training
             text_embeds = embeddings[:-1].cpu()  # Remove last token
             target_ids = input_ids[1:].cpu()     # Remove first token
-            return text_embeds, target_ids
+            input_tokens = input_ids[:-1].cpu()  # Remove last token for input
+            return text_embeds, input_tokens, target_ids
         
-        return embeddings.cpu()
+        return embeddings.cpu(), input_ids.cpu()
     
     def get_padding_embedding(self) -> torch.Tensor:
         """Get the embedding for the padding token."""
@@ -105,6 +106,10 @@ class EmbeddingProcessor:
             pad_embedding = pad_outputs.last_hidden_state.squeeze(0)[0]  # [hidden_dim]
         
         return pad_embedding.cpu()
+    
+    def get_padding_token_id(self) -> int:
+        """Get the token ID for the padding token."""
+        return self.text_tokenizer.pad_token_id
 
 
 class DatasetProcessor:
@@ -123,6 +128,7 @@ class DatasetProcessor:
         self.max_samples = max_samples
         self.max_text_length = 0
         self.padding_embedding = None
+        self.padding_token_id = None
     
     def process_batch(self, batch: Dict[str, List]) -> Dict[str, List]:
         """Process a batch of image-caption pairs."""
@@ -130,6 +136,7 @@ class DatasetProcessor:
         captions = []
         image_embeds = []
         text_embeds = []
+        text_tokens = []
         
         # Handle nested caption structure (like Flickr30k)
         batch_images = batch[self.image_column]
@@ -156,46 +163,60 @@ class DatasetProcessor:
                 captions.append(caption)
                 image_embeds.append(img_embed)
                 
-                # Generate text embedding (without autoregressive targets for now)
-                text_embed = self.embedding_processor.embed_text(caption, return_targets=False)
+                # Generate text embedding and tokens
+                text_embed, tokens = self.embedding_processor.embed_text(caption, return_targets=False)
                 text_embeds.append(text_embed)
+                text_tokens.append(tokens)
         
         return {
             self.image_column: images,
             self.caption_column: captions,
             "image_embed": image_embeds,
-            "text_embed": text_embeds
+            "text_embed": text_embeds,
+            "text_tokens": text_tokens
         }
     
     def calculate_max_length(self, dataset: Dataset) -> int:
         """Calculate maximum text sequence length in the dataset."""
         max_length = 0
         for item in tqdm(dataset, desc="Calculating max sequence length"):
-            text_embed = item["text_embed"]
-            if isinstance(text_embed, list):
-                max_length = max(max_length, len(text_embed))
+            # Use text_tokens to get the sequence length
+            text_tokens = item["text_tokens"]
+            if isinstance(text_tokens, list):
+                max_length = max(max_length, len(text_tokens))
             else:
-                max_length = max(max_length, text_embed.shape[0])
+                max_length = max(max_length, text_tokens.shape[0])
         return max_length
     
     def pad_text_embeddings(self, example: Dict[str, Any]) -> Dict[str, Any]:
-        """Pad text embeddings to max length."""
+        """Pad text embeddings and tokens to max length."""
         if self.padding_embedding is None:
             self.padding_embedding = self.embedding_processor.get_padding_embedding()
+        if self.padding_token_id is None:
+            self.padding_token_id = self.embedding_processor.get_padding_token_id()
         
         text_embed = example["text_embed"]
+        text_tokens = example["text_tokens"]
         
         # Convert to list if it's a tensor
         if isinstance(text_embed, torch.Tensor):
             text_embed = text_embed.tolist()
+        if isinstance(text_tokens, torch.Tensor):
+            text_tokens = text_tokens.tolist()
         
         current_length = len(text_embed)
         if current_length < self.max_text_length:
             padding_needed = self.max_text_length - current_length
             pad_embed_list = self.padding_embedding.tolist()
+            
+            # Pad embeddings
             text_embed.extend([pad_embed_list] * padding_needed)
+            
+            # Pad tokens
+            text_tokens.extend([self.padding_token_id] * padding_needed)
         
         example["text_embed"] = text_embed
+        example["text_tokens"] = text_tokens
         return example
     
     def process_dataset(
@@ -278,6 +299,8 @@ def convert_to_tensors(item: Dict[str, Any]) -> Dict[str, Any]:
         result["image_embed"] = torch.tensor(item["image_embed"])
     if isinstance(item["text_embed"], list):
         result["text_embed"] = torch.tensor(item["text_embed"])
+    if isinstance(item["text_tokens"], list):
+        result["text_tokens"] = torch.tensor(item["text_tokens"])
     
     return result
 
@@ -290,12 +313,14 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Stack tensors
     image_embeds = torch.stack([item["image_embed"] for item in batch])
     text_embeds = torch.stack([item["text_embed"] for item in batch])
+    text_tokens = torch.stack([item["text_tokens"] for item in batch])
     
     return {
         "images": [item["image"] for item in batch],
         "captions": [item["caption"] for item in batch],
         "image_embeds": image_embeds,  # [batch_size, num_patches, hidden_dim]
-        "text_embeds": text_embeds     # [batch_size, max_length, hidden_dim]
+        "text_embeds": text_embeds,    # [batch_size, max_length, hidden_dim]
+        "text_tokens": text_tokens     # [batch_size, max_length]
     }
 
 
@@ -310,8 +335,8 @@ def main():
         "image_column": "image",
         "caption_column": "caption",
         "max_samples": None,  # Set to None for full dataset
-        "output_file": "flickr30k_processed_splits.pkl",
-        "device": "cpu"
+        "output_file": "flickr30k_processed_splits_current.pkl",
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
     }
     
     print("=== Image-Text Dataset Processing Pipeline ===")
@@ -371,9 +396,11 @@ def main():
                 item = split_dataset[split_name][i]
                 img_embed = torch.tensor(item["image_embed"])
                 text_embed = torch.tensor(item["text_embed"])
+                text_tokens = torch.tensor(item["text_tokens"])
                 
-                print(f"  Item {i}: image_embed={img_embed.shape}, text_embed={text_embed.shape}")
+                print(f"  Item {i}: image_embed={img_embed.shape}, text_embed={text_embed.shape}, text_tokens={text_tokens.shape}")
                 print(f"  Item {i}: caption='{item['caption'][:50]}...'")
+                print(f"  Item {i}: first 10 tokens={text_tokens[:10].tolist()}")
     
     # Save processed dataset
     output_path = Path(CONFIG["output_file"])
