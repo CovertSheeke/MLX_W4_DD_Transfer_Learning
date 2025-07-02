@@ -27,6 +27,9 @@ class VisionLanguageTrainer:
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
+        # Track current upload file
+        self.current_upload_file = None
+        
         # Initialize mixed precision scaler
         self.use_amp = getattr(config, 'use_amp', True) and torch.cuda.is_available()
         self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
@@ -180,22 +183,48 @@ class VisionLanguageTrainer:
         
         # Only save and upload best models to save disk space
         if is_best:
+            # Clean up previous upload if complete
+            upload_slot_available = self.cleanup_previous_upload()
+            
+            # Check if we should skip saving to avoid disk space issues
+            if not upload_slot_available and self.config.delete_after_upload:
+                print(f"⏳ Previous upload still in progress, skipping checkpoint save to avoid disk issues")
+                return None
+            
+            # Safe to save - either no previous file or upload slot is available
             best_path = self.checkpoint_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
             print(f"💾 Best model saved at step {self.global_step} ({best_path.stat().st_size / 1e9:.1f}GB)")
             
-            # Upload best model to wandb for remote backup
-            if self.config.use_wandb and self.config.upload_checkpoints:
+            # Only upload if: it's time (every 2000 steps) AND no upload in progress
+            should_upload = (self.config.use_wandb and self.config.upload_checkpoints and 
+                           self.global_step % 2000 == 0)
+            
+            if should_upload:
                 upload_success = self.upload_checkpoint_to_wandb(best_path, f"best_model_step_{self.global_step}", is_best=True)
                 
-                # Delete local checkpoint after successful upload to save space
-                if upload_success and self.config.delete_after_upload:
+                if upload_success:
+                    # Track this file as currently uploading
+                    self.current_upload_file = str(best_path)
+                    print(f"✅ Upload queued successfully (tracking for completion)")
+                else:
+                    print(f"⚠️  Upload failed, deleting local file to save disk space")
+                    if self.config.delete_after_upload:
+                        best_path.unlink()
+                        print(f"🗑️  Deleted local checkpoint due to upload failure")
+            else:
+                # Handle non-upload scenarios
+                if self.global_step % 2000 != 0:
+                    print(f"📝 Best model saved (will upload at next 2000-step interval)")
+                
+                # Delete non-uploading files to save space
+                if self.config.delete_after_upload:
                     best_path.unlink()
-                    print(f"🗑️  Deleted local checkpoint after successful upload")
+                    print(f"🗑️  Deleted local checkpoint (not uploading this step)")
             
-            return best_path
+            return best_path if best_path.exists() else None
         else:
-            # For non-best checkpoints, create temporary file, upload, then delete
+            # For non-best checkpoints, create temporary file, upload, then always delete
             temp_checkpoint_path = self.checkpoint_dir / f"temp_checkpoint_step_{self.global_step}.pt"
             torch.save(checkpoint, temp_checkpoint_path)
             
@@ -207,14 +236,14 @@ class VisionLanguageTrainer:
                 upload_success = self.upload_checkpoint_to_wandb(temp_checkpoint_path, f"checkpoint_step_{self.global_step}", is_best=False)
                 
                 if upload_success:
-                    print(f"🗑️  Deleted temporary checkpoint after upload")
+                    print(f"✅ Upload successful")
                 else:
-                    print(f"⚠️  Keeping temporary checkpoint due to upload failure")
-                    return temp_checkpoint_path
+                    print(f"⚠️  Upload failed, but deleting anyway to save disk space")
             
-            # Always clean up temp file if not kept due to upload failure
+            # Always clean up temp file regardless of upload success
             if temp_checkpoint_path.exists():
                 temp_checkpoint_path.unlink()
+                print(f"🗑️  Deleted temporary checkpoint")
             
             return None
     
@@ -529,6 +558,39 @@ class VisionLanguageTrainer:
         print("🎉 Training completed!")
         if self.config.use_wandb:
             wandb.finish()
+
+    def is_file_being_uploaded(self, filepath):
+        """Check if wandb is currently uploading/accessing a file."""
+        if not filepath or not Path(filepath).exists():
+            return False
+            
+        try:
+            import subprocess
+            # Check if any wandb process is accessing this file
+            result = subprocess.run(['lsof', str(filepath)], 
+                                  capture_output=True, text=True, timeout=5)
+            
+            # Look for wandb processes in the output
+            lines = result.stdout.lower()
+            return 'wandb' in lines or 'python' in lines
+            
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            # If lsof fails, assume not uploading (safer to proceed)
+            return False
+    
+    def cleanup_previous_upload(self):
+        """Clean up the previous upload file if upload is complete."""
+        if self.current_upload_file and Path(self.current_upload_file).exists():
+            if not self.is_file_being_uploaded(self.current_upload_file):
+                # Upload complete, safe to delete
+                Path(self.current_upload_file).unlink()
+                print(f"🗑️  Cleaned up completed upload: {Path(self.current_upload_file).name}")
+                self.current_upload_file = None
+                return True
+            else:
+                print(f"⏳ Previous upload still in progress: {Path(self.current_upload_file).name}")
+                return False
+        return True  # No previous file to clean up
 
 
 def parse_args():
