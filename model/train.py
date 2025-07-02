@@ -434,7 +434,7 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--cache_dir', type=str, default='data/flickr_processed', 
                         help='Local cache directory for processed dataset')
-    parser.add_argument('--remote_repo', type=str, default=None,
+    parser.add_argument('--remote_repo', type=str, default='ntkuhn/flickr30k-clip-processed',
                         help='Remote repository to download dataset from (e.g., "username/repo-name")')
     parser.add_argument('--force_download', action='store_true', 
                         help='Force download fresh data even if cache exists')

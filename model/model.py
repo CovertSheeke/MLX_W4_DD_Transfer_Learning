@@ -1,4 +1,5 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3Model, CLIPVisionModel, CLIPVisionEmbeddings
+from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3Model, CLIPVisionModel
+from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
 import torch
 from torch import nn
 
