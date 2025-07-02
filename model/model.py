@@ -7,10 +7,14 @@ from torch import nn
 def extract_CLIP_image_embeddings(save_path="data/clip_image_embeddings"):
 
     full_model = CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14")
-    embeddings_state_dict = {
-        k: v for k, v in full_model.state_dict().items() 
-        if k.startswith("embeddings.patch_embedding")
-    }
+    
+    # Extract the embeddings sub-module and get its state_dict directly
+    embeddings_state_dict = full_model.vision_model.embeddings.state_dict()
+    
+    print("🎯 Extracted embeddings state_dict:")
+    for k, v in embeddings_state_dict.items():
+        print(f"  {k}: {v.shape}")
+    
     config = full_model.config
 
     del full_model
