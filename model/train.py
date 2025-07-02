@@ -219,20 +219,15 @@ class VisionLanguageTrainer:
         attention_mask = batch['attention_mask'].to(self.device)
         labels = batch['labels'].to(self.device)
         
-        # Forward pass
-        outputs = self.model(
+        # Forward pass - model returns logits directly
+        logits = self.model(
             image_data=images,
             input_ids=input_ids,
             attention_mask=attention_mask
         )
         
-        # Calculate loss
-        logits = outputs.last_hidden_state
-        # Project to vocabulary size for language modeling
-        lm_logits = self.model.lm_head(logits)
-        
         # Shift for causal LM: predict next token
-        shift_logits = lm_logits[..., :-1, :].contiguous()
+        shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         
         loss = self.criterion(
@@ -280,18 +275,15 @@ class VisionLanguageTrainer:
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                # Forward pass
-                outputs = self.model(
+                # Forward pass - model returns logits directly
+                logits = self.model(
                     image_data=images,
                     input_ids=input_ids,
                     attention_mask=attention_mask
                 )
                 
-                # Calculate loss
-                logits = outputs.last_hidden_state
-                lm_logits = self.model.lm_head(logits)
-                
-                shift_logits = lm_logits[..., :-1, :].contiguous()
+                # Shift for causal LM: predict next token
+                shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
                 
                 loss = self.criterion(
@@ -431,7 +423,8 @@ def parse_args():
     parser.add_argument('--lr_scheduler', type=str, default='cosine', choices=['cosine', 'linear'])
     
     # Data arguments
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='Number of worker processes for data loading (set to 0 for Windows compatibility)')
     parser.add_argument('--cache_dir', type=str, default='data/flickr_processed', 
                         help='Local cache directory for processed dataset')
     parser.add_argument('--remote_repo', type=str, default='ntkuhn/flickr30k-clip-processed',

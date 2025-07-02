@@ -78,7 +78,7 @@ Usage:
             "--eval_freq", "2000",
             "--log_freq", "100",
             "--max_eval_batches", "200",
-            "--num_workers", "8",
+            "--num_workers", "0",  # Set to 0 for Windows compatibility
             "--wandb_project", "flickr30k-qwen-large",
             "--run_name", "qwen_0.6b_large_scale"
         ]
