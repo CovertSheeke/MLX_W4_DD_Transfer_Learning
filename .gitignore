@@ -6,6 +6,7 @@
 /venv/
 /env/
 /.env/
+/data/
 
 ## Python bytecode and caches
 __pycache__/

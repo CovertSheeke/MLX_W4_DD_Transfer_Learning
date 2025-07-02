@@ -62,8 +62,9 @@ class FlickrDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx):
+        flat_image = self.image_data[self.image_ids[idx]]
         return {
-            'image': torch.from_numpy(self.image_data[self.image_ids[idx]]),  # Convert to tensor here
+            'image': torch.from_numpy(flat_image.reshape(3, 224, 224)),  # Convert to tensor here
             'caption': self.captions_data[idx]                               # Python string
         }
 
@@ -106,43 +107,6 @@ def qwen_collate_fn(batch, tokenizer):
     }
     
 
-def get_optimal_batch_size(device, image_size=(224, 224)):
-    """Automatically determine optimal batch size based on available memory."""
-    if device.type == 'cuda':
-        # GPU memory-based calculation
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory
-        if gpu_memory > 16e9:  # 16GB+
-            return 64
-        elif gpu_memory > 8e9:  # 8GB+
-            return 32
-        else:  # <8GB
-            return 16
-    else:
-        # CPU - smaller batches to avoid RAM issues
-        return 8
-    
-
-def process_image_batch(image_list, image_processor, batch_size=None):
-    # Define device properly
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    if batch_size is None:
-        batch_size = get_optimal_batch_size(device)
-
-    processed_images = []
-    total_batches = len(image_list) // batch_size
-    with tqdm(total=total_batches, desc=f"Processing on {device}") as pbar:
-        for i in range(0, len(image_list), batch_size):
-            batch_images = image_list[i:i + batch_size]
-        
-            with torch.no_grad():
-                batch_processed = image_processor(batch_images, return_tensors="pt")['pixel_values']
-
-                batch_processed = batch_processed.cpu().numpy()
-                processed_images.extend(batch_processed)
-                pbar.update(1)
-
-    return processed_images
 
 def preprocess_flickr_data():
     '''
@@ -164,23 +128,55 @@ def preprocess_flickr_data():
 
 
 
-    ds = load_dataset("nlphuji/flickr30k", cache_dir='data/flickr_data', split='test')
-    images = pd.DataFrame({'image': ds['image']})
-    captions = pd.DataFrame({'caption': ds['caption']}).explode('caption')
-    captions = captions.reset_index().rename(columns={'index': 'image_id'})
+    ds = load_dataset("nlphuji/flickr30k", cache_dir='data/flickr_data', split='test', streaming=True)
+    
+    # Initialize variables for streaming processing
+    processed_images = []
+    all_captions = []
+    batch_images = []
+    batch_size = 32
 
-    # Get image preprocessor
+    # Get image preprocessor and device
     print("Loading image processor...")
     image_processor = AutoImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
-    # Convert DataFrame column to list for batch processing
-    print("Starting batch image processing...")
-    processed_images = process_image_batch(images['image'].tolist(), image_processor)
 
-    # Preprocess the images
-    images['image'] = processed_images
+
+    for idx, item in enumerate(tqdm(ds, desc="Streaming dataset")):
+        # Collect images for batch processing
+        batch_images.append(item['image'])
+        
+        # Process captions immediately (lightweight)
+        for caption in item['caption']:
+            all_captions.append({'caption': caption, 'image_id': idx})
+        
+        # Process image batch when full
+        if len(batch_images) == batch_size:
+            with torch.no_grad():
+                batch_processed = image_processor(batch_images, return_tensors="pt")['pixel_values']
+                batch_processed = batch_processed.cpu().numpy()
+                flattened_batch = [img.flatten() for img in batch_processed]
+                processed_images.extend(flattened_batch)
+            
+            batch_images.clear()  # Free memory immediately
+            
+    # Process remaining images
+    if batch_images:
+        with torch.no_grad():
+            batch_processed = image_processor(batch_images, return_tensors="pt")['pixel_values']
+            batch_processed = batch_processed.cpu().numpy()
+            flattened_batch = [img.flatten() for img in batch_processed]
+            processed_images.extend(flattened_batch)
+
+    # Convert processed data to DataFrames (memory efficient - only metadata)
+    print("Creating DataFrames from processed data...")
+    images = pd.DataFrame({'image': processed_images})
+    captions = pd.DataFrame(all_captions)  # Already in correct format
     
-    #Note: This is a dictionary with keys 'train' and 'validation' whose values are pandas dataframes
+    print(f"Processed {len(images)} images and {len(captions)} captions")
+    
+    # Create splits from captions DataFrame
+    print("Creating dataset splits...")
     splits = create_dataset_splits(captions, train_ratio=0.9, val_ratio=0.1, seed=42)
 
     train_captions_data = pd.DataFrame({
@@ -208,16 +204,99 @@ def preprocess_flickr_data():
 
     
 
+
+def create_hf_dataset_for_upload(data_dir='data/flickr_processed'):
+    """Convert preprocessed data to Hugging Face Dataset format for upload."""
+    from datasets import Dataset, DatasetDict
+    import json
+    
+    data_dir = Path(data_dir)
+    
+    # Load preprocessed data
+    print("Loading preprocessed data...")
+    images_df = pd.read_parquet(data_dir / 'img_data.parquet')
+    train_captions_df = pd.read_parquet(data_dir / 'train_captions.parquet')
+    val_captions_df = pd.read_parquet(data_dir / 'val_captions.parquet')
+    
+    # Create mapping from image_id to image data
+    image_id_to_data = {idx: img_data for idx, img_data in enumerate(images_df['image'])}
+    
+    def prepare_split_data(captions_df, split_name):
+        print(f"Preparing {split_name} split...")
+        data = []
+        for _, row in captions_df.iterrows():
+            data.append({
+                'image_id': row['image_id'],
+                'image': image_id_to_data[row['image_id']],  # CLIP-processed image tensor
+                'caption': row['caption'],
+                'split': split_name
+            })
+        return data
+    
+    # Prepare data for both splits
+    train_data = prepare_split_data(train_captions_df, 'train')
+    val_data = prepare_split_data(val_captions_df, 'validation')
+    
+    # Create HF Datasets
+    train_dataset = Dataset.from_list(train_data)
+    val_dataset = Dataset.from_list(val_data)
+    
+    # Create DatasetDict
+    dataset_dict = DatasetDict({
+        'train': train_dataset,
+        'validation': val_dataset
+    })
+    
+    # Add metadata
+    dataset_dict.info.description = """
+    Flickr30k dataset preprocessed with CLIP ViT-Large-Patch14 image processor.
+    
+    Original dataset: https://huggingface.co/datasets/nlphuji/flickr30k
+    Preprocessing: Images processed with openai/clip-vit-large-patch14 processor
+    
+    Each image is a tensor of shape [3, 224, 224] with CLIP normalization applied.
+    Ready for use with CLIP-based vision-language models.
+    """
+    
+    return dataset_dict
+
+def upload_to_hf_hub(dataset_dict, repo_name, private=True):
+    """Upload dataset to Hugging Face Hub."""
+    from huggingface_hub import HfApi
+    
+    print(f"Uploading dataset to {repo_name}...")
+    
+    # Upload dataset
+    dataset_dict.push_to_hub(
+        repo_name,
+        private=private,  # Start private, make public later if desired
+        commit_message="Initial upload of CLIP-preprocessed Flickr30k dataset"
+    )
+    
+    print(f"✅ Dataset uploaded successfully!")
+    print(f"🔗 Access at: https://huggingface.co/datasets/{repo_name}")
+    
+    return f"https://huggingface.co/datasets/{repo_name}"
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--preprocess', action='store_true', help='Preprocess the Flickr30k dataset')
+    parser.add_argument('--upload', type=str, help='Upload preprocessed dataset to HF Hub (provide repo name)')
+    parser.add_argument('--private', action='store_true', help='Make uploaded dataset private (default: True)')
     args = parser.parse_args()
     
     if args.preprocess:
         print("🚀 Starting Flickr30k dataset preprocessing...")
         preprocess_flickr_data()
+    elif args.upload:
+        print(f"📤 Preparing dataset for upload to {args.upload}...")
+        dataset_dict = create_hf_dataset_for_upload()
+        upload_to_hf_hub(dataset_dict, args.upload, private=not args.private)
     else:
-        print("Use --preprocess flag to preprocess the dataset")
-        print("Example: python dataset.py --preprocess")
-
-
+        print("Available commands:")
+        print("  --preprocess: Preprocess the Flickr30k dataset")
+        print("  --upload <repo-name>: Upload preprocessed dataset to HF Hub")
+        print("\nExamples:")
+        print("  python dataset.py --preprocess")
+        print("  python dataset.py --upload your-username/flickr30k-clip-processed --private")
