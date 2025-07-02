@@ -27,6 +27,10 @@ class VisionLanguageTrainer:
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
+        # Initialize mixed precision scaler
+        self.use_amp = getattr(config, 'use_amp', True) and torch.cuda.is_available()
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        
         # Initialize model and tokenizer
         self.setup_model()
         self.setup_data()
@@ -36,6 +40,8 @@ class VisionLanguageTrainer:
         self.global_step = 0
         self.current_epoch = 0
         self.best_val_loss = float('inf')
+        
+        print(f"🔥 Mixed precision training: {'enabled' if self.use_amp else 'disabled'}")
         
     def setup_model(self):
         """Initialize model and tokenizer."""
@@ -156,8 +162,9 @@ class VisionLanguageTrainer:
             resume='allow' if self.config.resume_from_checkpoint else None
         )
         
-        # Watch model for gradient tracking
-        wandb.watch(self.model, log='all', log_freq=self.config.log_freq)
+        # Watch model for gradient tracking (disabled heavy logging for performance)
+        # wandb.watch(self.model, log='all', log_freq=self.config.log_freq)  # Too slow - uploads 7+ GB every 50 steps!
+        wandb.watch(self.model, log=None, log_freq=1000)  # Only log topology, no gradients/parameters
         
     def save_checkpoint(self, is_best=False, suffix=""):
         """Save model checkpoint."""
@@ -219,50 +226,65 @@ class VisionLanguageTrainer:
         attention_mask = batch['attention_mask'].to(self.device)
         labels = batch['labels'].to(self.device)
         
-        # Forward pass - model returns logits directly
-        logits = self.model(
-            image_data=images,
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
+        # Forward pass with mixed precision
+        with torch.amp.autocast('cuda', enabled=self.use_amp):
+            # Forward pass - model returns logits directly
+            logits = self.model(
+                image_data=images,
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            
+            # The model outputs logits for [image_tokens + text_tokens]
+            # We need to create labels that match this by padding with -100 for image tokens
+            batch_size = labels.shape[0]
+            image_token_length = 257
+            
+            # Create ignore tokens for image portion
+            image_ignore_tokens = torch.full(
+                (batch_size, image_token_length), 
+                -100, 
+                dtype=labels.dtype, 
+                device=labels.device
+            )
+            
+            # Concatenate image ignore tokens with text labels
+            padded_labels = torch.cat([image_ignore_tokens, labels], dim=1)
+            
+            # Shift for causal LM: predict next token
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = padded_labels[..., 1:].contiguous()
+            
+            loss = self.criterion(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            )
+            
+            # Scale loss for gradient accumulation
+            loss = loss / self.config.gradient_accumulation_steps
         
-        # The model outputs logits for [image_tokens + text_tokens]
-        # We need to create labels that match this by padding with -100 for image tokens
-        batch_size = labels.shape[0]
-        image_token_length = 257
-        
-        # Create ignore tokens for image portion
-        image_ignore_tokens = torch.full(
-            (batch_size, image_token_length), 
-            -100, 
-            dtype=labels.dtype, 
-            device=labels.device
-        )
-        
-        # Concatenate image ignore tokens with text labels
-        padded_labels = torch.cat([image_ignore_tokens, labels], dim=1)
-        
-        # Shift for causal LM: predict next token
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = padded_labels[..., 1:].contiguous()
-        
-        loss = self.criterion(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1)
-        )
-        
-        # Scale loss for gradient accumulation
-        loss = loss / self.config.gradient_accumulation_steps
-        
-        # Backward pass
-        loss.backward()
+        # Backward pass with proper mixed precision handling
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
         # Only update optimizer every accumulation_steps
         if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            if self.use_amp:
+                # Gradient clipping with scaler
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                
+                # Optimizer step with scaler
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                # Standard gradient clipping and optimizer step
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.optimizer.step()
             
-            self.optimizer.step()
+            # Scheduler step (only after successful optimizer step)
             self.scheduler.step()
             self.optimizer.zero_grad()
         
@@ -291,39 +313,45 @@ class VisionLanguageTrainer:
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                # Forward pass - model returns logits directly
-                logits = self.model(
-                    image_data=images,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask
-                )
-                
-                # Create labels that match logits by padding with -100 for image tokens
-                batch_size = labels.shape[0]
-                image_token_length = 257
-                
-                # Create ignore tokens for image portion
-                image_ignore_tokens = torch.full(
-                    (batch_size, image_token_length), 
-                    -100, 
-                    dtype=labels.dtype, 
-                    device=labels.device
-                )
-                
-                # Concatenate image ignore tokens with text labels
-                padded_labels = torch.cat([image_ignore_tokens, labels], dim=1)
-                
-                # Shift for causal LM: predict next token
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = padded_labels[..., 1:].contiguous()
-                
-                loss = self.criterion(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1)
-                )
+                # Forward pass with mixed precision
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    # Forward pass - model returns logits directly
+                    logits = self.model(
+                        image_data=images,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask
+                    )
+                    
+                    # Create labels that match logits by padding with -100 for image tokens
+                    batch_size = labels.shape[0]
+                    image_token_length = 257
+                    
+                    # Create ignore tokens for image portion
+                    image_ignore_tokens = torch.full(
+                        (batch_size, image_token_length), 
+                        -100, 
+                        dtype=labels.dtype, 
+                        device=labels.device
+                    )
+                    
+                    # Concatenate image ignore tokens with text labels
+                    padded_labels = torch.cat([image_ignore_tokens, labels], dim=1)
+                    
+                    # Shift for causal LM: predict next token
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = padded_labels[..., 1:].contiguous()
+                    
+                    loss = self.criterion(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)
+                    )
                 
                 total_loss += loss.item()
                 num_batches += 1
+                
+                # Memory cleanup during evaluation
+                if num_batches % 50 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
                 # Don't evaluate entire val set every time (too expensive)
                 if num_batches >= self.config.max_eval_batches:
@@ -445,13 +473,15 @@ def parse_args():
     
     # Training arguments
     parser.add_argument('--num_epochs', type=int, default=3)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--eval_batch_size', type=int, default=16)
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--eval_batch_size', type=int, default=8)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=2)
     parser.add_argument('--learning_rate', type=float, default=2e-5)
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
     parser.add_argument('--lr_scheduler', type=str, default='cosine', choices=['cosine', 'linear'])
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                        help='Use automatic mixed precision training')
     
     # Data arguments
     parser.add_argument('--num_workers', type=int, default=0,
