@@ -196,7 +196,7 @@ class FlickrDataset(Dataset):
         self.image_data = image_df['image'].to_numpy()
         self.captions_data = captions_df['caption'].tolist()
         self.image_ids = captions_df['image_id'].tolist()
-
+        
     def __len__(self):
         return self.length
 
@@ -245,7 +245,7 @@ def qwen_collate_fn(batch, tokenizer):
         'labels': labels
     }
     
-
+    
 
 def preprocess_flickr_data():
     '''
@@ -338,38 +338,213 @@ def preprocess_flickr_data():
     print(f"   📝 Train captions: {len(train_captions_data)}")
     print(f"   📝 Val captions: {len(val_captions_data)}")
 
-    return ds
+    return ds 
 
 
     
 
 
-def create_hf_dataset_for_upload(data_dir='data/flickr_processed'):
-    """Convert preprocessed data to Hugging Face Dataset format for upload."""
-    from datasets import Dataset, DatasetDict
-    import json
+def upload_parquet_files_to_hf_hub(data_dir='data/flickr_processed', repo_name=None, private=True):
+    """
+    Upload parquet files directly to HuggingFace Hub without loading into memory.
+    This is much more memory efficient for large datasets.
+    """
+    from huggingface_hub import HfApi, create_repo
+    import tempfile
+    import os
+    
+    if not repo_name:
+        raise ValueError("Please provide a repo_name for upload")
     
     data_dir = Path(data_dir)
     
-    # Load preprocessed data
-    print("Loading preprocessed data...")
-    images_df = pd.read_parquet(data_dir / 'img_data.parquet')
+    # Check that all required files exist
+    required_files = {
+        'img_data.parquet': data_dir / 'img_data.parquet',
+        'train_captions.parquet': data_dir / 'train_captions.parquet', 
+        'val_captions.parquet': data_dir / 'val_captions.parquet'
+    }
+    
+    for filename, filepath in required_files.items():
+        if not filepath.exists():
+            raise FileNotFoundError(f"Required file not found: {filepath}")
+    
+    # Initialize HF API
+    api = HfApi()
+    
+    # Create repository
+    try:
+        create_repo(repo_name, repo_type="dataset", private=private)
+        print(f"✅ Created repository: {repo_name}")
+    except Exception as e:
+        print(f"Repository might already exist: {e}")
+    
+    # Create a README file with dataset information
+    readme_content = f"""# Flickr30k CLIP-Preprocessed Dataset
+
+This dataset contains the Flickr30k dataset preprocessed with CLIP ViT-Large-Patch14 image processor.
+
+## Files
+
+- `img_data.parquet`: Preprocessed images as flattened numpy arrays (shape: [3, 224, 224] -> flattened)
+- `train_captions.parquet`: Training split captions with image_id mapping
+- `val_captions.parquet`: Validation split captions with image_id mapping
+
+## Usage
+
+```python
+import pandas as pd
+import torch
+import numpy as np
+
+# Load the data
+images_df = pd.read_parquet('img_data.parquet')
+train_captions_df = pd.read_parquet('train_captions.parquet')
+val_captions_df = pd.read_parquet('val_captions.parquet')
+
+# Access an image
+image_id = 0
+flat_image = images_df.iloc[image_id]['image']
+image_tensor = torch.from_numpy(flat_image.reshape(3, 224, 224))
+
+# Access captions for that image
+captions_for_image = train_captions_df[train_captions_df['image_id'] == image_id]['caption'].tolist()
+```
+
+## Original Dataset
+
+Original dataset: [nlphuji/flickr30k](https://huggingface.co/datasets/nlphuji/flickr30k)
+
+## Preprocessing
+
+Images were processed using the CLIP ViT-Large-Patch14 image processor:
+- Resized to 224x224
+- CLIP normalization applied
+- Converted to tensors and flattened for storage efficiency
+
+## Dataset Statistics
+
+- Total images: Check `img_data.parquet` length
+- Train captions: Check `train_captions.parquet` length  
+- Validation captions: Check `val_captions.parquet` length
+- Train/Validation split: 90/10
+"""
+
+    # Create temporary README file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+        f.write(readme_content)
+        readme_path = f.name
+    
+    try:
+        # Upload README first
+        print("📝 Uploading README.md...")
+        api.upload_file(
+            path_or_fileobj=readme_path,
+            path_in_repo="README.md",
+            repo_id=repo_name,
+            repo_type="dataset",
+            commit_message="Add dataset README"
+        )
+        
+        # Upload each parquet file
+        for filename, filepath in required_files.items():
+            print(f"📤 Uploading {filename}... (this may take a while for large files)")
+            api.upload_file(
+                path_or_fileobj=str(filepath),
+                path_in_repo=filename,
+                repo_id=repo_name,
+                repo_type="dataset",
+                commit_message=f"Upload {filename}"
+            )
+            print(f"✅ {filename} uploaded successfully")
+            
+    finally:
+        # Clean up temporary README file
+        os.unlink(readme_path)
+    
+    print(f"\n🎉 Dataset upload completed!")
+    print(f"🔗 Access at: https://huggingface.co/datasets/{repo_name}")
+    print(f"\n📋 To use this dataset:")
+    print(f"```python")
+    print(f"from huggingface_hub import hf_hub_download")
+    print(f"import pandas as pd")
+    print(f"")
+    print(f"# Download files")
+    print(f"img_file = hf_hub_download(repo_id='{repo_name}', filename='img_data.parquet', repo_type='dataset')")
+    print(f"train_file = hf_hub_download(repo_id='{repo_name}', filename='train_captions.parquet', repo_type='dataset')")
+    print(f"val_file = hf_hub_download(repo_id='{repo_name}', filename='val_captions.parquet', repo_type='dataset')")
+    print(f"")
+    print(f"# Load data")
+    print(f"images_df = pd.read_parquet(img_file)")
+    print(f"train_captions_df = pd.read_parquet(train_file)")
+    print(f"val_captions_df = pd.read_parquet(val_file)")
+    print(f"```")
+    
+    return f"https://huggingface.co/datasets/{repo_name}"
+
+
+def create_hf_dataset_for_upload_chunked(data_dir='data/flickr_processed', chunk_size=1000):
+    """Convert preprocessed data to Hugging Face Dataset format using chunked processing."""
+    from datasets import Dataset, DatasetDict
+    import pyarrow.parquet as pq
+    import tempfile
+    import gc
+    
+    data_dir = Path(data_dir)
+    
+    # Load caption data (this is much smaller)
+    print("Loading caption data...")
     train_captions_df = pd.read_parquet(data_dir / 'train_captions.parquet')
     val_captions_df = pd.read_parquet(data_dir / 'val_captions.parquet')
     
-    # Create mapping from image_id to image data
-    image_id_to_data = {idx: img_data for idx, img_data in enumerate(images_df['image'])}
+    # Get unique image IDs needed for each split
+    train_image_ids = set(train_captions_df['image_id'].unique())
+    val_image_ids = set(val_captions_df['image_id'].unique())
+    all_needed_ids = train_image_ids.union(val_image_ids)
+    
+    print(f"Need to load {len(all_needed_ids)} unique images")
+    
+    # Read parquet file in chunks to avoid memory issues
+    parquet_file = pq.ParquetFile(data_dir / 'img_data.parquet')
+    total_rows = parquet_file.metadata.num_rows
+    
+    print(f"Reading {total_rows} images in chunks of {chunk_size}...")
+    
+    # Store image data as we process chunks
+    image_id_to_data = {}
+    
+    for batch_idx, batch in enumerate(parquet_file.iter_batches(batch_size=chunk_size)):
+        print(f"Processing chunk {batch_idx + 1}/{(total_rows + chunk_size - 1) // chunk_size}")
+        
+        # Convert batch to pandas for easier processing
+        chunk_df = batch.to_pandas()
+        
+        # Only keep images we actually need
+        for idx, row in chunk_df.iterrows():
+            global_idx = batch_idx * chunk_size + idx
+            if global_idx in all_needed_ids:
+                image_id_to_data[global_idx] = row['image']
+        
+        # Free memory
+        del chunk_df
+        gc.collect()
+    
+    print(f"Loaded {len(image_id_to_data)} required images")
     
     def prepare_split_data(captions_df, split_name):
         print(f"Preparing {split_name} split...")
         data = []
         for _, row in captions_df.iterrows():
-            data.append({
-                'image_id': row['image_id'],
-                'image': image_id_to_data[row['image_id']],  # CLIP-processed image tensor
-                'caption': row['caption'],
-                'split': split_name
-            })
+            image_id = row['image_id']
+            if image_id in image_id_to_data:
+                data.append({
+                    'image_id': image_id,
+                    'image': image_id_to_data[image_id],
+                    'caption': row['caption'],
+                    'split': split_name
+                })
+            else:
+                print(f"Warning: Missing image data for image_id {image_id}")
         return data
     
     # Prepare data for both splits
@@ -377,8 +552,13 @@ def create_hf_dataset_for_upload(data_dir='data/flickr_processed'):
     val_data = prepare_split_data(val_captions_df, 'validation')
     
     # Create HF Datasets
+    print("Creating HuggingFace datasets...")
     train_dataset = Dataset.from_list(train_data)
     val_dataset = Dataset.from_list(val_data)
+    
+    # Free the image cache
+    del image_id_to_data
+    gc.collect()
     
     # Create DatasetDict
     dataset_dict = DatasetDict({
@@ -399,8 +579,110 @@ def create_hf_dataset_for_upload(data_dir='data/flickr_processed'):
     
     return dataset_dict
 
+def create_hf_dataset_for_upload(data_dir='data/flickr_processed'):
+    """Wrapper that uses chunked processing to avoid memory issues."""
+    return create_hf_dataset_for_upload_chunked(data_dir, chunk_size=1000)
+
+def upload_to_hf_hub_streaming(data_dir, repo_name, private=True, upload_batch_size=500):
+    """Upload dataset to HF Hub in streaming chunks to minimize memory usage."""
+    from datasets import Dataset, DatasetDict
+    from huggingface_hub import HfApi, create_repo
+    import pyarrow.parquet as pq
+    import gc
+    
+    data_dir = Path(data_dir)
+    
+    # Create the repository first
+    api = HfApi()
+    try:
+        create_repo(repo_name, repo_type="dataset", private=private)
+        print(f"✅ Created repository: {repo_name}")
+    except Exception as e:
+        print(f"Repository might already exist: {e}")
+    
+    # Load caption data
+    print("Loading caption data...")
+    train_captions_df = pd.read_parquet(data_dir / 'train_captions.parquet')
+    val_captions_df = pd.read_parquet(data_dir / 'val_captions.parquet')
+    
+    # Get unique image IDs for each split
+    train_image_ids = set(train_captions_df['image_id'].unique())
+    val_image_ids = set(val_captions_df['image_id'].unique())
+    
+    # Process each split separately
+    for split_name, captions_df, needed_ids in [
+        ('train', train_captions_df, train_image_ids),
+        ('validation', val_captions_df, val_image_ids)
+    ]:
+        print(f"\n📤 Processing {split_name} split...")
+        
+        # Read images in chunks and match with captions
+        parquet_file = pq.ParquetFile(data_dir / 'img_data.parquet')
+        total_rows = parquet_file.metadata.num_rows
+        
+        split_data = []
+        processed_images = 0
+        
+        for batch_idx, batch in enumerate(parquet_file.iter_batches(batch_size=1000)):
+            chunk_df = batch.to_pandas()
+            
+            # Find matching captions for images in this chunk
+            for idx, row in chunk_df.iterrows():
+                global_idx = batch_idx * 1000 + idx
+                if global_idx in needed_ids:
+                    # Get all captions for this image
+                    image_captions = captions_df[captions_df['image_id'] == global_idx]
+                    for _, caption_row in image_captions.iterrows():
+                        split_data.append({
+                            'image_id': global_idx,
+                            'image': row['image'],
+                            'caption': caption_row['caption'],
+                            'split': split_name
+                        })
+                        processed_images += 1
+                
+                # Upload in batches to avoid memory buildup
+                if len(split_data) >= upload_batch_size:
+                    print(f"  Uploading batch of {len(split_data)} items...")
+                    batch_dataset = Dataset.from_list(split_data)
+                    
+                    # Upload this batch
+                    batch_dataset.push_to_hub(
+                        repo_name,
+                        split=split_name,
+                        private=private,
+                        append=True if processed_images > upload_batch_size else False
+                    )
+                    
+                    # Clear memory
+                    del split_data, batch_dataset
+                    split_data = []
+                    gc.collect()
+            
+            del chunk_df
+            gc.collect()
+        
+        # Upload remaining data
+        if split_data:
+            print(f"  Uploading final batch of {len(split_data)} items...")
+            batch_dataset = Dataset.from_list(split_data)
+            batch_dataset.push_to_hub(
+                repo_name,
+                split=split_name,
+                private=private,
+                append=processed_images > len(split_data)
+            )
+            del split_data, batch_dataset
+            gc.collect()
+        
+        print(f"✅ {split_name} split uploaded: {processed_images} items")
+    
+    print(f"\n🎉 Dataset upload completed!")
+    print(f"🔗 Access at: https://huggingface.co/datasets/{repo_name}")
+    return f"https://huggingface.co/datasets/{repo_name}"
+
 def upload_to_hf_hub(dataset_dict, repo_name, private=True):
-    """Upload dataset to Hugging Face Hub."""
+    """Upload dataset to Hugging Face Hub (original method)."""
     from huggingface_hub import HfApi
     
     print(f"Uploading dataset to {repo_name}...")
@@ -422,20 +704,34 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--preprocess', action='store_true', help='Preprocess the Flickr30k dataset')
     parser.add_argument('--upload', type=str, help='Upload preprocessed dataset to HF Hub (provide repo name)')
+    parser.add_argument('--upload-parquet', type=str, help='Upload parquet files directly to HF Hub (memory efficient)')
     parser.add_argument('--private', action='store_true', help='Make uploaded dataset private (default: True)')
+    parser.add_argument('--chunk-size', type=int, default=1000, help='Chunk size for reading parquet files (default: 1000)')
     args = parser.parse_args()
     
     if args.preprocess:
         print("🚀 Starting Flickr30k dataset preprocessing...")
         preprocess_flickr_data()
+    elif args.upload_parquet:
+        print(f"📤 Uploading parquet files directly to {args.upload_parquet}...")
+        upload_parquet_files_to_hf_hub(
+            data_dir='data/flickr_processed',
+            repo_name=args.upload_parquet, 
+            private=not args.private
+        )
     elif args.upload:
         print(f"📤 Preparing dataset for upload to {args.upload}...")
-        dataset_dict = create_hf_dataset_for_upload()
+        print(f"Using chunk size: {args.chunk_size} (use --chunk-size to adjust if running out of memory)")
+        dataset_dict = create_hf_dataset_for_upload_chunked(chunk_size=args.chunk_size)
         upload_to_hf_hub(dataset_dict, args.upload, private=not args.private)
     else:
         print("Available commands:")
         print("  --preprocess: Preprocess the Flickr30k dataset")
-        print("  --upload <repo-name>: Upload preprocessed dataset to HF Hub")
+        print("  --upload <repo-name>: Upload preprocessed dataset to HF Hub (memory intensive)")
+        print("  --upload-parquet <repo-name>: Upload parquet files directly to HF Hub (memory efficient)")
+        print("  --chunk-size <size>: Control memory usage when uploading (default: 1000)")
         print("\nExamples:")
         print("  python dataset.py --preprocess")
+        print("  python dataset.py --upload-parquet your-username/flickr30k-clip-processed --private")
         print("  python dataset.py --upload your-username/flickr30k-clip-processed --private")
+        print("  python dataset.py --upload your-username/flickr30k-clip-processed --chunk-size 500  # for low memory")
