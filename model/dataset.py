@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import argparse
 from tqdm import tqdm
+import pyarrow.parquet as pq
 
 
 def load_flickr_data(split='train'):
@@ -74,11 +75,12 @@ class FlickrDatasetCache:
                 print(f"❌ Cache file missing: {file_path}")
                 return False
                 
-        # Basic validation - check if files are readable
+        # Basic validation - check if files are readable using metadata (memory efficient)
         try:
             for file_type, file_path in self.required_files.items():
-                df = pd.read_parquet(file_path)
-                if len(df) == 0:
+                # Use parquet metadata instead of loading entire file
+                parquet_file = pq.ParquetFile(file_path)
+                if parquet_file.metadata.num_rows == 0:
                     print(f"❌ Cache file empty: {file_path}")
                     return False
             print("✅ Valid cache found")
@@ -159,6 +161,9 @@ class FlickrDatasetCache:
 
 
 class FlickrDataset(Dataset):
+    # Class-level shared image cache
+    _shared_image_cache = {}
+    
     def __init__(self, split='train', remote_repo=None, cache_dir='data/flickr_processed', force_download=False):
         """
         Initialize Flickr30k dataset.
@@ -186,14 +191,62 @@ class FlickrDataset(Dataset):
         else:  # validation
             captions_file = file_paths['val_captions']
             
-        # Load data (same as before)
-        image_df = pd.read_parquet(file_paths['images'])
+        # Load captions 
         captions_df = pd.read_parquet(captions_file)        
+        
+        # Load or reuse shared image data
+        images_file_path = str(file_paths['images'])  # Convert to string for dict key
+        
+        if images_file_path not in self._shared_image_cache:
+            print(f"Streaming image data from {file_paths['images']} (first time)...")
+            
+            # Stream parquet file to build numpy array incrementally
+            parquet_file = pq.ParquetFile(file_paths['images'])
+            total_rows = parquet_file.metadata.num_rows
+            print(f"Total images to load: {total_rows}")
+            
+            # Get the shape of a single image by reading the first batch
+            first_batch = next(parquet_file.iter_batches(batch_size=1))
+            first_df = first_batch.to_pandas()
+            image_shape = first_df['image'].iloc[0].shape
+            print(f"Image shape: {image_shape}")
+            
+            # Pre-allocate the entire numpy array
+            print(f"Pre-allocating numpy array for {total_rows} images...")
+            image_data = np.empty((total_rows,) + image_shape, dtype=first_df['image'].iloc[0].dtype)
+            
+            # Stream and write directly into the pre-allocated array
+            chunk_size = 1000  # Process in chunks to manage memory
+            current_idx = 0
+            
+            for batch in parquet_file.iter_batches(batch_size=chunk_size):
+                # Convert batch to pandas and extract images
+                batch_df = batch.to_pandas()
+                batch_size_actual = len(batch_df)
+                
+                # Write directly into the pre-allocated array
+                for i, image_array in enumerate(batch_df['image']):
+                    image_data[current_idx + i] = image_array
+                
+                current_idx += batch_size_actual
+                
+                # Print progress
+                if current_idx % (chunk_size * 10) == 0 or current_idx == total_rows:
+                    print(f"  Loaded {current_idx}/{total_rows} images...")
+            
+            print(f"✅ Loaded {len(image_data)} images into pre-allocated numpy array")
+            
+            # Cache the image data for reuse
+            self._shared_image_cache[images_file_path] = image_data
+        else:
+            print(f"✅ Reusing cached image data ({len(self._shared_image_cache[images_file_path])} images)")
+        
+        # Reference the shared image data
+        self.image_data = self._shared_image_cache[images_file_path]
 
         # Save dataset attributes
         self.length = len(captions_df)
         self.split = split
-        self.image_data = image_df['image'].to_numpy()
         self.captions_data = captions_df['caption'].tolist()
         self.image_ids = captions_df['image_id'].tolist()
         
