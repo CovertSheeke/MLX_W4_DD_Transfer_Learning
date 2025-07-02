@@ -14,8 +14,8 @@ import numpy as np
 from transformers import AutoTokenizer
 import os
 
-from dataset import FlickrDataset, qwen_collate_fn
-from model import QwenModel
+from .dataset import FlickrDataset, qwen_collate_fn
+from .model import QwenModel
 
 
 class VisionLanguageTrainer:
@@ -33,6 +33,10 @@ class VisionLanguageTrainer:
         # Initialize mixed precision scaler
         self.use_amp = getattr(config, 'use_amp', True) and torch.cuda.is_available()
         self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        
+        # Pre-allocate tensors for memory efficiency
+        self.image_ignore_tokens_cache = {}
+        self.max_batch_size = max(config.batch_size, config.eval_batch_size)
         
         # Initialize model and tokenizer
         self.setup_model()
@@ -299,6 +303,26 @@ class VisionLanguageTrainer:
         
         print(f"✅ Resumed from epoch {self.current_epoch}, step {self.global_step}")
         
+    def get_image_ignore_tokens(self, batch_size, image_token_length, dtype, device):
+        """Get pre-allocated or create image ignore tokens to avoid memory allocation in training loop."""
+        cache_key = (batch_size, image_token_length, dtype, device)
+        
+        if cache_key not in self.image_ignore_tokens_cache:
+            self.image_ignore_tokens_cache[cache_key] = torch.full(
+                (batch_size, image_token_length), 
+                -100, 
+                dtype=dtype, 
+                device=device
+            )
+        
+        return self.image_ignore_tokens_cache[cache_key]
+    
+    def clear_tensor_cache(self):
+        """Clear pre-allocated tensor cache to prevent memory accumulation."""
+        self.image_ignore_tokens_cache.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
     def train_step(self, batch):
         """Single training step."""
         self.model.train()
@@ -324,23 +348,20 @@ class VisionLanguageTrainer:
             image_token_length = 257
             
             # Create ignore tokens for image portion
-            image_ignore_tokens = torch.full(
-                (batch_size, image_token_length), 
-                -100, 
-                dtype=labels.dtype, 
-                device=labels.device
-            )
+            image_ignore_tokens = self.get_image_ignore_tokens(batch_size, image_token_length, labels.dtype, labels.device)
             
             # Concatenate image ignore tokens with text labels
             padded_labels = torch.cat([image_ignore_tokens, labels], dim=1)
             
-            # Shift for causal LM: predict next token
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = padded_labels[..., 1:].contiguous()
+            # Shift for causal LM: predict next token (avoid .contiguous() to prevent memory copies)
+            shift_logits = logits[..., :-1, :]
+            shift_labels = padded_labels[..., 1:]
             
+            # Reshape tensors for loss calculation (use reshape instead of view for better memory management)
+            vocab_size = shift_logits.size(-1)
             loss = self.criterion(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1)
+                shift_logits.reshape(-1, vocab_size),
+                shift_labels.reshape(-1)
             )
             
             # Scale loss for gradient accumulation
@@ -379,10 +400,21 @@ class VisionLanguageTrainer:
             
             self.optimizer.zero_grad()
         
+        # Calculate gradient norm without retaining gradients (memory leak fix)
+        grad_norm = 0.0
+        if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+            # Only calculate grad norm when we actually update (avoids memory retention)
+            total_norm = 0.0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            grad_norm = total_norm ** (1. / 2)
+        
         return {
             'loss': loss.item() * self.config.gradient_accumulation_steps,  # Report unscaled loss for logging
             'lr': self.optimizer.param_groups[0]['lr'],
-            'grad_norm': torch.nn.utils.clip_grad_norm_(self.model.parameters(), float('inf')).item()
+            'grad_norm': grad_norm
         }
         
     def evaluate(self):
@@ -418,23 +450,20 @@ class VisionLanguageTrainer:
                     image_token_length = 257
                     
                     # Create ignore tokens for image portion
-                    image_ignore_tokens = torch.full(
-                        (batch_size, image_token_length), 
-                        -100, 
-                        dtype=labels.dtype, 
-                        device=labels.device
-                    )
+                    image_ignore_tokens = self.get_image_ignore_tokens(batch_size, image_token_length, labels.dtype, labels.device)
                     
                     # Concatenate image ignore tokens with text labels
                     padded_labels = torch.cat([image_ignore_tokens, labels], dim=1)
                     
-                    # Shift for causal LM: predict next token
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = padded_labels[..., 1:].contiguous()
+                    # Shift for causal LM: predict next token (avoid .contiguous() to prevent memory copies)
+                    shift_logits = logits[..., :-1, :]
+                    shift_labels = padded_labels[..., 1:]
                     
+                    # Reshape tensors for loss calculation (use reshape instead of view for better memory management)
+                    vocab_size = shift_logits.size(-1)
                     loss = self.criterion(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1)
+                        shift_logits.reshape(-1, vocab_size),
+                        shift_labels.reshape(-1)
                     )
                 
                 total_loss += loss.item()
@@ -526,10 +555,21 @@ class VisionLanguageTrainer:
                     
                     print(f"\n📊 Step {self.global_step} - Val Loss: {eval_metrics['val_loss']:.4f} {'🏆' if is_best else ''}")
                 
-                # Memory cleanup
-                if self.global_step % 100 == 0:
+                # More frequent memory cleanup to prevent gradual accumulation
+                if self.global_step % 20 == 0:  # Increased frequency from 100 to 20
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
+                
+                # Explicit cleanup of batch tensors and metrics (memory leak prevention)
+                del batch, metrics
+                if self.global_step % 50 == 0:  # Periodic forced garbage collection
+                    import gc
+                    gc.collect()
+                
+                # Clear tensor cache periodically to prevent memory growth
+                if self.global_step % 500 == 0:
+                    self.clear_tensor_cache()
+                    print(f"🧹 Cleared tensor cache at step {self.global_step}")
             
             # End of epoch summary
             avg_epoch_loss = epoch_loss / max(num_batches, 1)
@@ -549,6 +589,10 @@ class VisionLanguageTrainer:
                     'epoch/epoch': epoch,
                     'global_step': self.global_step
                 })
+            
+            # Clear tensor cache at end of epoch to prevent memory accumulation
+            self.clear_tensor_cache()
+            print(f"🧹 End-of-epoch cleanup completed")
         
         print("🎉 Training completed!")
         if self.config.use_wandb:

@@ -16,7 +16,7 @@ from transformers import AutoTokenizer, CLIPImageProcessor
 from typing import Optional, List
 import json
 
-from model import QwenModel
+from .model import QwenModel
 
 
 class VisionLanguageInference:
