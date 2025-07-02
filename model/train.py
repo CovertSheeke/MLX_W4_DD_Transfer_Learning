@@ -188,18 +188,59 @@ class VisionLanguageTrainer:
             torch.save(checkpoint, best_path)
             print(f"💾 Best model saved at step {self.global_step}")
             
+            # Upload best model to wandb for remote backup
+            if self.config.use_wandb and self.config.upload_checkpoints:
+                self.upload_checkpoint_to_wandb(best_path, f"best_model_step_{self.global_step}", is_best=True)
+        
+        # Upload latest checkpoint periodically for backup
+        if (self.config.use_wandb and self.config.upload_checkpoints and 
+            self.global_step % self.config.checkpoint_upload_freq == 0):
+            self.upload_checkpoint_to_wandb(checkpoint_path, f"checkpoint_step_{self.global_step}", is_best=False)
+            
         # Keep only last N checkpoints to save space
         self.cleanup_checkpoints()
         
         return checkpoint_path
+    
+    def upload_checkpoint_to_wandb(self, checkpoint_path, artifact_name, is_best=False):
+        """Upload checkpoint to wandb as artifact."""
+        try:
+            print(f"☁️  Uploading {'best model' if is_best else 'checkpoint'} to wandb...")
+            
+            # Create artifact
+            artifact_type = "best_model" if is_best else "checkpoint"
+            artifact = wandb.Artifact(
+                name=artifact_name,
+                type=artifact_type,
+                description=f"Model checkpoint at step {self.global_step} (val_loss: {self.best_val_loss:.4f})" if is_best 
+                           else f"Training checkpoint at step {self.global_step}",
+                metadata={
+                    "step": self.global_step,
+                    "epoch": self.current_epoch,
+                    "val_loss": self.best_val_loss,
+                    "model_name": self.config.model_name
+                }
+            )
+            
+            # Add checkpoint file
+            artifact.add_file(str(checkpoint_path))
+            
+            # Log artifact to wandb
+            wandb.log_artifact(artifact)
+            print(f"✅ {'Best model' if is_best else 'Checkpoint'} uploaded successfully!")
+            
+        except Exception as e:
+            print(f"⚠️  Failed to upload checkpoint to wandb: {e}")
+            # Don't fail training if upload fails
         
-    def cleanup_checkpoints(self, keep_last=3):
+    def cleanup_checkpoints(self, keep_last=1):
         """Remove old checkpoints to save disk space."""
         checkpoints = list(self.checkpoint_dir.glob("checkpoint_step_*.pt"))
         if len(checkpoints) > keep_last:
             checkpoints.sort(key=lambda x: x.stat().st_mtime)
             for old_checkpoint in checkpoints[:-keep_last]:
                 old_checkpoint.unlink()
+                print(f"🗑️  Cleaned up old checkpoint: {old_checkpoint.name}")
                 
     def load_checkpoint(self, checkpoint_path):
         """Load model from checkpoint."""
@@ -276,16 +317,20 @@ class VisionLanguageTrainer:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 
-                # Optimizer step with scaler
+                # Check scale before optimizer step
+                scale_before = self.scaler.get_scale()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                
+                # Only step scheduler if optimizer actually stepped (no NaN/Inf gradients)
+                if self.scaler.get_scale() >= scale_before:
+                    self.scheduler.step()
             else:
                 # Standard gradient clipping and optimizer step
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
+                self.scheduler.step()
             
-            # Scheduler step (only after successful optimizer step)
-            self.scheduler.step()
             self.optimizer.zero_grad()
         
         return {
@@ -500,6 +545,10 @@ def parse_args():
     parser.add_argument('--log_freq', type=int, default=50)
     parser.add_argument('--eval_freq', type=int, default=500)  # Evaluate every 500 steps
     parser.add_argument('--max_eval_batches', type=int, default=100)  # Limit eval to save time
+    parser.add_argument('--upload_checkpoints', action='store_true', default=True,
+                        help='Upload checkpoints to wandb as artifacts for remote backup')
+    parser.add_argument('--checkpoint_upload_freq', type=int, default=2000,
+                        help='Upload regular checkpoints every N steps (best models always uploaded)')
     
     # Resume training
     parser.add_argument('--resume_from_checkpoint', type=str, default=None)
