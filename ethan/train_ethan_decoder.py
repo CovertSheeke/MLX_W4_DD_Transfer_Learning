@@ -75,6 +75,28 @@ def main():
 if __name__ == "__main__":
     main()
 
+### PSEUDOCODE FOR THIS IMPLEMENTATION
+# 1. Load the necessary libraries and modules.
+# 2. Define the `train` function that will handle the training logic.
+#    2.1 Train recieves a decoder model as an argument.
+#    2.2 Train recieves a dataset as an argument.
+#    2.3 Train for one epoch and calculate cross-entropy loss of output tokens and target tokens
+#    2.4 Backpropagate the loss and update the model parameters.
+#    2.5 Save the trained model and embeddings.
+#    2.6 Return the trained model.
+#    2.7 Return the embeddings.
+#    2.8 Return the loss.
+#    2.9 Run an eval on test dataset and return the results.
+#.        2.9.1 Eval function should show the image, the caption, and the predicted caption for the top 3 and bottom 3 predictions and 3 random predictions.
+#    2.10 Return the eval results.
+# 3. Define the `main` function to set up the training environment.
+#    3.1 Initialize Weights & Biases for experiment tracking.
+#    3.2 Define the configuration for the decoder model.
+#.   3.3 Load the dataset from a pickle file.
+#    3.4 Check if the dataset is loaded correctly and contains the necessary splits.
+#    3.5 Create an instance of the `DecoderFull` model with the specified
+#.   3.6 Change dataset to a torch object, use a dataloader for batching
+
 ### IDEAL PSEUDOCODE
 # 1. Load the un-embedded dataset from a pickle file.
 # 2. Initialize the Weights & Biases project.
