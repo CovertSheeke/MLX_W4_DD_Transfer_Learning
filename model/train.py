@@ -226,9 +226,25 @@ class VisionLanguageTrainer:
             attention_mask=attention_mask
         )
         
+        # The model outputs logits for [image_tokens + text_tokens]
+        # We need to create labels that match this by padding with -100 for image tokens
+        batch_size = labels.shape[0]
+        image_token_length = 257
+        
+        # Create ignore tokens for image portion
+        image_ignore_tokens = torch.full(
+            (batch_size, image_token_length), 
+            -100, 
+            dtype=labels.dtype, 
+            device=labels.device
+        )
+        
+        # Concatenate image ignore tokens with text labels
+        padded_labels = torch.cat([image_ignore_tokens, labels], dim=1)
+        
         # Shift for causal LM: predict next token
         shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        shift_labels = padded_labels[..., 1:].contiguous()
         
         loss = self.criterion(
             shift_logits.view(-1, shift_logits.size(-1)),
@@ -282,9 +298,24 @@ class VisionLanguageTrainer:
                     attention_mask=attention_mask
                 )
                 
+                # Create labels that match logits by padding with -100 for image tokens
+                batch_size = labels.shape[0]
+                image_token_length = 257
+                
+                # Create ignore tokens for image portion
+                image_ignore_tokens = torch.full(
+                    (batch_size, image_token_length), 
+                    -100, 
+                    dtype=labels.dtype, 
+                    device=labels.device
+                )
+                
+                # Concatenate image ignore tokens with text labels
+                padded_labels = torch.cat([image_ignore_tokens, labels], dim=1)
+                
                 # Shift for causal LM: predict next token
                 shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                shift_labels = padded_labels[..., 1:].contiguous()
                 
                 loss = self.criterion(
                     shift_logits.view(-1, shift_logits.size(-1)),
