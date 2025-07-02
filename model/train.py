@@ -498,7 +498,7 @@ def parse_args():
     parser.add_argument('--wandb_project', type=str, default='vision-language-training')
     parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--log_freq', type=int, default=50)
-    parser.add_argument('--eval_freq', type=int, default=1000)  # Evaluate every 1000 steps
+    parser.add_argument('--eval_freq', type=int, default=500)  # Evaluate every 500 steps
     parser.add_argument('--max_eval_batches', type=int, default=100)  # Limit eval to save time
     
     # Resume training
