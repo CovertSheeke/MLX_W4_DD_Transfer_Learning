@@ -103,6 +103,31 @@ class VisionLanguageTrainer:
                 p.requires_grad = True
 
 
+        #unfreeze vision blocks
+        NUM_VISION_BLOCKS = 1          # 1 or 2 is usually enough
+
+        # 1) Find the stack of vision transformer blocks.
+        #    This works for both OpenAI-CLIP (`visual.transformer.resblocks`)
+        #    and HF ViT-CLIP (`vision_model.encoder.layers`).
+        vision = self.model.image_encoder
+        if hasattr(vision, "visual"):                         # OpenAI CLIP
+            vt_blocks = vision.visual.transformer.resblocks
+            final_norm = vision.visual.ln_post
+        elif hasattr(vision, "vision_model"):                 # HF CLIP / CLIP-ViT
+            vt_blocks = vision.vision_model.encoder.layers
+            final_norm = vision.vision_model.post_layernorm
+        else:
+            raise ValueError("Vision encoder topology not recognised")
+
+        # 2) Unfreeze the last N blocks
+        for block in vt_blocks[-NUM_VISION_BLOCKS:]:
+            for p in block.parameters():
+                p.requires_grad = True
+
+        # 3) Unfreeze the final LayerNorm that sits after all blocks
+        for p in final_norm.parameters():
+            p.requires_grad = True
+
 
         # Update lm_head vocabulary size to match tokenizer (in case we added tokens)
         vocab_size = len(self.tokenizer)
