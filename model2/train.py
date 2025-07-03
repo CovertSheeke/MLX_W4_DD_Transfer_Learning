@@ -27,9 +27,6 @@ class VisionLanguageTrainer:
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        # Track current upload file
-        self.current_upload_file = None
-        
         # Initialize mixed precision scaler
         self.use_amp = getattr(config, 'use_amp', True) and torch.cuda.is_available()
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
