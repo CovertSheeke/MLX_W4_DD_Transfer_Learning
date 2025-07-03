@@ -33,6 +33,24 @@ class ClipModule(CLIPVisionTransformer):
         # Replace post_layernorm with identity instead of deleting it
         self.post_layernorm = nn.Identity()
 
+    @classmethod
+    def from_pretrained(cls, model_name_or_path):
+        """Load from pretrained CLIP model and adapt to our custom architecture"""
+        # Load the full pretrained model
+        full_model = CLIPVisionModel.from_pretrained(model_name_or_path)
+        
+        # Create our custom instance
+        custom_model = cls(full_model.config)
+        
+        # Transfer weights from pretrained model
+        custom_model.load_state_dict(full_model.vision_model.state_dict(), strict=False)
+        
+        # Clean up
+        del full_model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        return custom_model
+
     @can_return_tuple
     def forward(self, pixel_values: Optional[torch.FloatTensor] = None, interpolate_pos_encoding: bool = False, output_attentions: Optional[bool] = None, output_hidden_states: Optional[bool] = None, return_dict: Optional[bool] = None):
         if pixel_values is None:
