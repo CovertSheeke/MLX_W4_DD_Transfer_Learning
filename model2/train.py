@@ -106,27 +106,40 @@ class VisionLanguageTrainer:
         #unfreeze vision blocks
         NUM_VISION_BLOCKS = 1          # 1 or 2 is usually enough
 
-        # 1) Find the stack of vision transformer blocks.
-        #    This works for both OpenAI-CLIP (`visual.transformer.resblocks`)
-        #    and HF ViT-CLIP (`vision_model.encoder.layers`).
+        # 1) Locate the list of vision transformer blocks + the output norm.
+        #    Handle three common layouts:
+        #      a) openai/clip   -> vision.visual.transformer.resblocks + vision.visual.ln_post
+        #      b) HF CLIP/VIT   -> vision.vision_model.encoder.layers  + vision.vision_model.post_layernorm
+        #      c) Custom ClipModule (inherits CLIPVisionTransformer) -> vision.encoder.layers + vision.post_layernorm
+
         vision = self.model.image_encoder
-        if hasattr(vision, "visual"):                         # OpenAI CLIP
+        if hasattr(vision, "visual"):
+            # ✱ OpenAI CLIP reference implementation
             vt_blocks = vision.visual.transformer.resblocks
             final_norm = vision.visual.ln_post
-        elif hasattr(vision, "vision_model"):                 # HF CLIP / CLIP-ViT
+        elif hasattr(vision, "vision_model"):
+            # ✱ HuggingFace CLIP/ViT wrappers
             vt_blocks = vision.vision_model.encoder.layers
             final_norm = vision.vision_model.post_layernorm
+        elif hasattr(vision, "encoder") and hasattr(vision.encoder, "layers"):
+            # ✱ Direct CLIPVisionTransformer (our ClipModule)
+            vt_blocks = vision.encoder.layers
+            # ClipModule overrides post_layernorm with Identity but attribute still exists
+            final_norm = getattr(vision, "post_layernorm", None)
         else:
-            raise ValueError("Vision encoder topology not recognised")
+            raise ValueError("Vision encoder topology not recognised: {}".format(type(vision)))
 
+        # Safeguard: if final_norm is None or has no parameters, skip it later.
+        
         # 2) Unfreeze the last N blocks
         for block in vt_blocks[-NUM_VISION_BLOCKS:]:
             for p in block.parameters():
                 p.requires_grad = True
 
         # 3) Unfreeze the final LayerNorm that sits after all blocks
-        for p in final_norm.parameters():
-            p.requires_grad = True
+        if final_norm is not None:
+            for p in final_norm.parameters():
+                p.requires_grad = True
 
 
         # Update lm_head vocabulary size to match tokenizer (in case we added tokens)
