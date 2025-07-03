@@ -90,6 +90,22 @@ class VisionLanguageTrainer:
         for param in self.model.image_projection.parameters():
             param.requires_grad = True
 
+        # unfreeze q_proj, k_proj, v_proj, o_proj + down_proj and norms in last 2 blocks
+        for layer in self.model.qwen.layers[-2:]:
+            # attention projections
+            for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+                for p in getattr(layer.self_attn, proj_name).parameters():
+                    p.requires_grad = True
+            # FFN value matrix
+            for p in layer.mlp.down_proj.parameters():   # Qwen3 uses down_proj
+                p.requires_grad = True
+            # corresponding LayerNorms
+            for p in layer.input_layernorm.parameters():
+                p.requires_grad = True
+            for p in layer.post_attention_layernorm.parameters():
+                p.requires_grad = True
+
+
 
         # Update lm_head vocabulary size to match tokenizer (in case we added tokens)
         vocab_size = len(self.tokenizer)
@@ -149,12 +165,26 @@ class VisionLanguageTrainer:
         print("⚙️ Setting up training components...")
         
         # Optimizer
-        self.optimizer = AdamW(
-            self.model.parameters(),
+        decay, no_decay = [], []
+        
+        for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim == 1 or name.endswith(".bias"):    # LN/BN/RMSNorm weights & any bias
+                no_decay.append(p)
+            else:
+                decay.append(p)
+
+        self.optimizer = torch.optim.AdamW(
+            [
+                {"params": decay,     "weight_decay": 0.01},
+                {"params": no_decay,  "weight_decay": 0.0},
+            ],
             lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            betas=(0.9, 0.95)
-        )
+            betas=(0.9, 0.95),
+        )   
+
+        
         
         # Calculate total steps (accounting for gradient accumulation)
         steps_per_epoch = len(self.train_loader) // self.config.gradient_accumulation_steps
@@ -315,8 +345,25 @@ class VisionLanguageTrainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Try to load optimizer state, but handle parameter group mismatch gracefully
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("✅ Optimizer state loaded successfully")
+        except (ValueError, KeyError) as e:
+            print(f"⚠️  Optimizer state mismatch (likely due to parameter group changes): {e}")
+            print("🔄 Continuing with fresh optimizer state...")
+            # Reset optimizer state but keep the current parameter groups
+            pass
+        
+        # Try to load scheduler state
+        try:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print("✅ Scheduler state loaded successfully")
+        except (ValueError, KeyError) as e:
+            print(f"⚠️  Scheduler state mismatch: {e}")
+            print("🔄 Continuing with fresh scheduler state...")
+            pass
         
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']

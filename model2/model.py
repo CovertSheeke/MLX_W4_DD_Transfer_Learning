@@ -87,7 +87,7 @@ class QwenModelv2(nn.Module):
         batch_size = input_ids.shape[0]
         
         # Process image 
-        encoded_image_embeddings = self.image_encoder(image_data)  # [batch, 257, 1024]
+        encoded_image_embeddings = self.image_encoder(image_data).last_hidden_state  # [batch, 257, 1024]
         image_tokens = self.image_projection(encoded_image_embeddings)  # [batch, 257, hidden_size]
         
         # Get text embeddings from Qwen
