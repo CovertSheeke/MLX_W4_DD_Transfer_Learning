@@ -226,7 +226,7 @@ class VisionLanguageTrainer:
                 torch.save(checkpoint, best_path)
                 print(f"💾 Best model saved at step {self.global_step} ({best_path.stat().st_size / 1e9:.1f}GB)")
                 
-                upload_success = self.upload_checkpoint_to_wandb(best_path, f"best_model_step_{self.global_step}", is_best=True)
+                upload_success = self.upload_checkpoint_to_wandb(best_path, "best_model2", is_best=True)
                 
                 if upload_success:
                     # Track this file as currently uploading
