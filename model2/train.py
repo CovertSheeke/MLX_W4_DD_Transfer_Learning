@@ -695,7 +695,9 @@ def parse_args():
                         help='Upload regular checkpoints every N steps (best models always uploaded)')
     parser.add_argument('--delete_after_upload', action='store_true', default=True,
                         help='Delete local checkpoints after successful upload to save disk space')
-    
+    parser.add_argument('--freeze', type=str, default='all', choices=['qwen', 'clip', 'all'],
+                        help='Which parts of the model to freeze (qwen, clip, all). Default: all -- only projection layer is trainable')
+
     # Resume training
     parser.add_argument('--resume_from_checkpoint', type=str, default=None)
     
