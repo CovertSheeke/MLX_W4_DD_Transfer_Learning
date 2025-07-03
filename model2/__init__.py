@@ -7,11 +7,9 @@ of a vision-language model combining Qwen and CLIP.
 
 from .model import QwenModelv2
 from model.dataset import FlickrDataset, qwen_collate_fn
-from model.inference import VisionLanguageInference
 
 __all__ = [
     'QwenModelv2',
     'FlickrDataset', 
-    'qwen_collate_fn',
-    'VisionLanguageInference'
+    'qwen_collate_fn'
 ] 

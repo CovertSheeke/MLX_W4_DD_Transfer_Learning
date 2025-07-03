@@ -6,8 +6,6 @@ from torch import nn
 from transformers.models.clip.modeling_clip import BaseModelOutput
 from typing import Optional
 
-# Import FlickrDataset from the model package (different from model2)
-from model.dataset import FlickrDataset, qwen_collate_fn
 
 def extract_CLIP_image_embeddings(save_path="data/clip_image_embeddings"):
 

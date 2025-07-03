@@ -27,9 +27,6 @@ class VisionLanguageTrainer:
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        # Track current upload file
-        self.current_upload_file = None
-        
         # Initialize mixed precision scaler
         self.use_amp = getattr(config, 'use_amp', True) and torch.cuda.is_available()
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
@@ -224,9 +221,19 @@ class VisionLanguageTrainer:
         # wandb.watch(self.model, log='all', log_freq=self.config.log_freq)  # Too slow - uploads 7+ GB every 50 steps!
         wandb.watch(self.model, log=None, log_freq=1000)  # Only log topology, no gradients/parameters
         
-    def save_checkpoint(self, is_best=False, suffix=""):
-        """Save model checkpoint."""
-        checkpoint = {
+    def save_checkpoint(self, is_best: bool = False):
+        """Simplified checkpointing logic.
+
+        1. Always overwrite `latest.pt` with the full training state so training can
+           resume from the most recent step.
+        2. When a new best validation loss is achieved (`is_best=True`), also
+           overwrite `best.pt`.
+        3. If wandb uploads are enabled, push the file to the cloud: always for a
+           new best, and periodically for `latest.pt` based on
+           `checkpoint_upload_freq`.
+        """
+
+        state = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,
             'model_state_dict': self.model.state_dict(),
@@ -235,68 +242,27 @@ class VisionLanguageTrainer:
             'best_val_loss': self.best_val_loss,
             'config': vars(self.config)
         }
-        
-        # Only save and upload best models to save disk space
+
+        # (1) Save / overwrite the latest checkpoint every time this is called
+        latest_path = self.checkpoint_dir / "latest.pt"
+        torch.save(state, latest_path)
+        print(f"💾 Saved latest checkpoint → {latest_path}")
+
+        # (2) If this is the best model so far, save / overwrite best checkpoint
         if is_best:
-            # Check if we should actually save this best model
-            should_upload = (self.config.use_wandb and self.config.upload_checkpoints and 
-                           self.global_step % 2000 == 0)
-            
+            best_path = self.checkpoint_dir / "best.pt"
+            torch.save(state, best_path)
+            print(f"🏆 New best model saved → {best_path}")
+
+        # (3) Optional remote backup to wandb
+        if self.config.use_wandb and self.config.upload_checkpoints:
+            # Always push a new best; push latest periodically
+            should_upload = is_best or (self.global_step % self.config.checkpoint_upload_freq == 0)
             if should_upload:
-                # Clean up previous upload if complete
-                upload_slot_available = self.cleanup_previous_upload()
-                
-                # Check if we should skip saving to avoid disk space issues
-                if not upload_slot_available and self.config.delete_after_upload:
-                    print(f"⏳ Previous upload still in progress, skipping checkpoint save to avoid disk issues")
-                    return None
-                
-                # Safe to save and upload
-                best_path = self.checkpoint_dir / "best_model.pt"
-                torch.save(checkpoint, best_path)
-                print(f"💾 Best model saved at step {self.global_step} ({best_path.stat().st_size / 1e9:.1f}GB)")
-                
-                upload_success = self.upload_checkpoint_to_wandb(best_path, f"best_model_step_{self.global_step}", is_best=True)
-                
-                if upload_success:
-                    # Track this file as currently uploading
-                    self.current_upload_file = str(best_path)
-                    print(f"✅ Upload queued successfully (tracking for completion)")
-                    return best_path
-                else:
-                    print(f"⚠️  Upload failed, deleting local file to save disk space")
-                    if self.config.delete_after_upload:
-                        best_path.unlink()
-                        print(f"🗑️  Deleted local checkpoint due to upload failure")
-                    return None
-            else:
-                # Not uploading this step - don't save to disk at all
-                print(f"🏆 Best model achieved at step {self.global_step} (will save at next 2000-step interval)")
-                return None
-        else:
-            # For non-best checkpoints, create temporary file, upload, then always delete
-            temp_checkpoint_path = self.checkpoint_dir / f"temp_checkpoint_step_{self.global_step}.pt"
-            torch.save(checkpoint, temp_checkpoint_path)
-            
-            # Upload if it's time for periodic backup
-            if (self.config.use_wandb and self.config.upload_checkpoints and 
-                self.global_step % self.config.checkpoint_upload_freq == 0):
-                
-                print(f"💾 Temporary checkpoint saved ({temp_checkpoint_path.stat().st_size / 1e9:.1f}GB)")
-                upload_success = self.upload_checkpoint_to_wandb(temp_checkpoint_path, f"checkpoint_step_{self.global_step}", is_best=False)
-                
-                if upload_success:
-                    print(f"✅ Upload successful")
-                else:
-                    print(f"⚠️  Upload failed, but deleting anyway to save disk space")
-            
-            # Always clean up temp file regardless of upload success
-            if temp_checkpoint_path.exists():
-                temp_checkpoint_path.unlink()
-                print(f"🗑️  Deleted temporary checkpoint")
-            
-            return None
-    
+                target_path = (self.checkpoint_dir / "best.pt") if is_best else latest_path
+                artifact_name = "best" if is_best else "latest"
+                self.upload_checkpoint_to_wandb(target_path, artifact_name, is_best=is_best)
+        
     def upload_checkpoint_to_wandb(self, checkpoint_path, artifact_name, is_best=False):
         """Upload checkpoint to wandb as artifact."""
         try:

@@ -17,29 +17,31 @@ from typing import Optional, List
 import json
 
 from .model import QwenModel
+from model2.model import QwenModelv2
 
 
 class VisionLanguageInference:
-    def __init__(self, checkpoint_path: str, device: Optional[str] = None):
+    def __init__(self, checkpoint_path: str, model_id: int = 2, device: Optional[str] = None):
         """
         Initialize inference pipeline
         
         Args:
             checkpoint_path: Path to trained model checkpoint
+            model_id: Model version to use (1 for QwenModel, 2 for QwenModelv2)
             device: Device to run inference on ('cuda', 'cpu', or None for auto)
         """
         self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
         print(f"🔧 Using device: {self.device}")
         
         # Load checkpoint
-        self.load_checkpoint(checkpoint_path)
+        self.load_checkpoint(checkpoint_path, model_id)
         
         # Setup image processor (using CLIP's processor for consistency)
         self.image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
         
         print("✅ Inference pipeline ready!")
         
-    def load_checkpoint(self, checkpoint_path: str):
+    def load_checkpoint(self, checkpoint_path: str, model_id: int = 2):
         """Load model and tokenizer from checkpoint"""
         print(f"📂 Loading checkpoint from {checkpoint_path}")
         
@@ -64,7 +66,13 @@ class VisionLanguageInference:
         self.tokenizer.add_special_tokens(special_tokens)
         
         # Initialize model
-        self.model = QwenModel(model_name)
+        print(f"🔧 Initializing model with ID: {model_id}")
+        if model_id == 1:
+            self.model = QwenModel(model_name)
+        elif model_id == 2:
+            self.model = QwenModelv2(model_name)
+        else:
+            raise ValueError(f"Unknown model_id: {model_id}. Use 1 for QwenModel or 2 for QwenModelv2")
         
         # Resize embeddings to match tokenizer (in case special tokens were added)
         self.model.qwen.resize_token_embeddings(len(self.tokenizer))
@@ -243,6 +251,104 @@ class VisionLanguageInference:
             # Decode generated text (skip the original prompt)
             original_length = input_ids.shape[1]
             new_tokens = generated_sequence[:, original_length:]
+            generated_text = self.tokenizer.decode(new_tokens[0], skip_special_tokens=True)
+            
+        return generated_text.strip()
+    
+    def generate_caption_direct(
+        self, 
+        image_source: str,
+        max_length: int = 100,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 50,
+        repetition_penalty: float = 1.1,
+        do_sample: bool = True
+    ) -> str:
+        """
+        Generate caption for an image without any text prompt (matching training format)
+        
+        Args:
+            image_source: Path to image file or URL
+            max_length: Maximum length of generated caption
+            temperature: Sampling temperature (higher = more random)
+            top_p: Nucleus sampling threshold
+            top_k: Top-k sampling parameter
+            repetition_penalty: Penalty for repeated tokens
+            do_sample: Whether to use sampling (False = greedy)
+            
+        Returns:
+            Generated caption text
+        """
+        # Load and preprocess image
+        image = self.load_image(image_source)
+        image_tensor = self.preprocess_image(image)
+        
+        # Start with just the image end token (matching training format)
+        im_end_id = self.tokenizer.get_added_vocab()['<|im_end|>']
+        input_ids = torch.tensor([[im_end_id]], dtype=torch.long, device=self.device)
+        
+        print(f"🎯 Generating caption directly from image (no text prompt)")
+        
+        with torch.no_grad():
+            # Use autoregressive generation
+            generated_sequence = input_ids.clone()
+            
+            for step in range(max_length):
+                # Forward pass
+                current_outputs = self.model(
+                    image_data=image_tensor,
+                    input_ids=generated_sequence,
+                    attention_mask=torch.ones_like(generated_sequence)
+                )
+                
+                # Get next token logits
+                next_token_logits = current_outputs[:, -1, :]
+                
+                # Apply repetition penalty
+                if step > 0:
+                    for token_id in generated_sequence[0].unique():
+                        if token_id in generated_sequence[0]:
+                            next_token_logits[0, token_id] /= repetition_penalty
+                
+                # Apply temperature
+                next_token_logits = next_token_logits / temperature
+                
+                # Apply top-k filtering
+                if top_k > 0:
+                    top_k_logits, top_k_indices = torch.topk(next_token_logits, min(top_k, next_token_logits.size(-1)))
+                    next_token_logits = torch.full_like(next_token_logits, float('-inf'))
+                    next_token_logits.scatter_(1, top_k_indices, top_k_logits)
+                
+                # Apply top-p filtering
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    
+                    # Remove tokens with cumulative probability above threshold
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    next_token_logits[indices_to_remove] = float('-inf')
+                
+                # Sample next token
+                if do_sample:
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                
+                # Check for end of sequence
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    break
+                
+                # Append to sequence
+                generated_sequence = torch.cat([generated_sequence, next_token], dim=1)
+            
+            # Decode generated text (skip the initial <|im_end|> token)
+            new_tokens = generated_sequence[:, 1:]  # Skip the initial <|im_end|> token
             generated_text = self.tokenizer.decode(new_tokens[0], skip_special_tokens=True)
             
         return generated_text.strip()
