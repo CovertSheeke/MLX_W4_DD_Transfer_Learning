@@ -13,9 +13,9 @@ from tqdm import tqdm
 import numpy as np
 from transformers import AutoTokenizer
 import os
+from .model import QwenModelv2
 
 from model.dataset import FlickrDataset, qwen_collate_fn
-from .model import QwenModelv2
 
 
 class VisionLanguageTrainer:
@@ -65,12 +65,32 @@ class VisionLanguageTrainer:
         special_tokens = {'additional_special_tokens': ['<|im_start|>', '<|im_end|>']}
         self.tokenizer.add_special_tokens(special_tokens)
         
-        self.model = QwenModel(self.config.model_name)
+        self.model = QwenModelv2(self.config.model_name)
         self.model.to(self.device)
         
         # Resize token embeddings if we added tokens
         self.model.qwen.resize_token_embeddings(len(self.tokenizer))
         
+        # Freeze model
+        if self.config.freeze == 'qwen':
+            for param in self.model.qwen.parameters():
+                param.requires_grad = False
+        elif self.config.freeze == 'clip':
+            for param in self.model.image_encoder.parameters():
+                param.requires_grad = False
+        elif self.config.freeze == 'all':
+            for param in self.model.qwen.parameters():
+                param.requires_grad = False
+            for param in self.model.image_encoder.parameters():
+                param.requires_grad = False
+
+        #in any case unfreeze the lm_head and the image projection layer
+        for param in self.model.lm_head.parameters():
+            param.requires_grad = True
+        for param in self.model.image_projection.parameters():
+            param.requires_grad = True
+
+
         # Update lm_head vocabulary size to match tokenizer (in case we added tokens)
         vocab_size = len(self.tokenizer)
         if self.model.lm_head.out_features != vocab_size:
@@ -78,6 +98,7 @@ class VisionLanguageTrainer:
         
         print(f"📊 Model loaded on {self.device}")
         print(f"📝 Tokenizer vocab size: {len(self.tokenizer)}")
+
         
     def setup_data(self):
         """Setup datasets and dataloaders."""
