@@ -11,9 +11,14 @@ import time
 from datetime import datetime
 from tqdm import tqdm
 import numpy as np
+import random
+import gc
+import subprocess
 from transformers import AutoTokenizer
 import os
 from .model import QwenModelv2
+import random
+from matplotlib import pyplot as plt
 
 from model.dataset import FlickrDataset, qwen_collate_fn
 
@@ -103,7 +108,7 @@ class VisionLanguageTrainer:
     def setup_data(self):
         """Setup datasets and dataloaders."""
         print("📚 Setting up datasets...")
-        
+
         # Create datasets with cache/download configuration
         self.train_dataset = FlickrDataset(
             split='train',
@@ -117,14 +122,19 @@ class VisionLanguageTrainer:
             cache_dir=self.config.cache_dir,
             force_download=self.config.force_download
         )
-        
+
+        # Limit dataset size for quick testing if specified
+        if self.config.sample_size:
+            self.train_dataset = torch.utils.data.Subset(self.train_dataset, range(self.config.sample_size))
+            self.val_dataset = torch.utils.data.Subset(self.val_dataset, range(self.config.sample_size))
+
         print(f"📖 Train samples: {len(self.train_dataset)}")
         print(f"📖 Val samples: {len(self.val_dataset)}")
-        
+
         # Create collate function with tokenizer
         def collate_fn(batch):
             return qwen_collate_fn(batch, self.tokenizer)
-        
+
         # Create dataloaders
         self.train_loader = DataLoader(
             self.train_dataset,
@@ -134,7 +144,7 @@ class VisionLanguageTrainer:
             num_workers=self.config.num_workers,
             pin_memory=True if self.device.type == 'cuda' else False
         )
-        
+
         self.val_loader = DataLoader(
             self.val_dataset,
             batch_size=self.config.eval_batch_size,
@@ -501,6 +511,249 @@ class VisionLanguageTrainer:
         avg_loss = total_loss / max(num_batches, 1)
         return {'val_loss': avg_loss}
         
+    def evaluate_with_visualization(self, save_dir="eval_results", max_batches=1):
+        """Run comprehensive evaluation with loss statistics and visualizations on a limited sample."""
+        print("🔍 Running comprehensive evaluation with visualizations on a small sample...")
+        self.model.eval()
+        
+        # Create save directory
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        
+        total_loss = 0
+        num_batches = 0
+        evaluation_samples = []
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="Evaluating with viz")):
+                if batch is None:
+                    continue
+                    
+                # Move batch to device
+                images = batch['images'].to(self.device)
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                # Forward pass with mixed precision
+                with torch.amp.autocast('cuda', enabled=self.use_amp):
+                    # Forward pass - model returns logits directly
+                    logits = self.model(
+                        image_data=images,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask
+                    )
+                    
+                    # Create labels that match logits by padding with -100 for image tokens
+                    batch_size = labels.shape[0]
+                    image_token_length = 257
+                    
+                    # Create ignore tokens for image portion
+                    image_ignore_tokens = self.get_image_ignore_tokens(batch_size, image_token_length, labels.dtype, labels.device)
+                    
+                    # Concatenate image ignore tokens with text labels
+                    padded_labels = torch.cat([image_ignore_tokens, labels], dim=1)
+                    
+                    # Shift for causal LM: predict next token
+                    shift_logits = logits[..., :-1, :]
+                    shift_labels = padded_labels[..., 1:]
+                    
+                    # Calculate per-sample losses for visualization
+                    vocab_size = shift_logits.size(-1)
+                    criterion_no_reduction = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+                    
+                    # Calculate loss per token
+                    token_losses = criterion_no_reduction(
+                        shift_logits.reshape(-1, vocab_size),
+                        shift_labels.reshape(-1)
+                    ).reshape(batch_size, -1)  # [batch_size, seq_len]
+                    
+                    # Calculate average loss per sample (excluding ignored tokens)
+                    sample_losses = []
+                    for i in range(batch_size):
+                        # Only consider text tokens (after image tokens)
+                        text_start_idx = image_token_length
+                        text_losses = token_losses[i][text_start_idx:]
+                        valid_losses = text_losses[text_losses != 0]  # Exclude padding
+                        
+                        if len(valid_losses) > 0:
+                            sample_loss = valid_losses.mean().item()
+                        else:
+                            sample_loss = float('inf')
+                        sample_losses.append(sample_loss)
+                    
+                    # Get predictions (argmax of logits for text portion)
+                    predicted_tokens = torch.argmax(shift_logits, dim=-1)
+                    
+                    # Store sample information for visualization
+                    for i in range(batch_size):
+                        if sample_losses[i] != float('inf'):
+                            # Extract text portion only
+                            text_start_idx = image_token_length
+                            pred_text_tokens = predicted_tokens[i][text_start_idx:]
+                            target_text_tokens = shift_labels[i][text_start_idx:]
+                            
+                            # Remove padding tokens for cleaner visualization
+                            valid_mask = target_text_tokens != -100
+                            if valid_mask.sum() > 0:
+                                pred_text_clean = pred_text_tokens[valid_mask]
+                                target_text_clean = target_text_tokens[valid_mask]
+                                
+                                evaluation_samples.append({
+                                    'loss': sample_losses[i],
+                                    'image': images[i].cpu(),
+                                    'predicted_tokens': pred_text_clean.cpu(),
+                                    'target_tokens': target_text_clean.cpu(),
+                                    'batch_idx': batch_idx,
+                                    'sample_idx': i
+                                })
+                    
+                    # Calculate batch loss for overall statistics
+                    batch_loss = self.criterion(
+                        shift_logits.reshape(-1, vocab_size),
+                        shift_labels.reshape(-1)
+                    )
+                
+                total_loss += batch_loss.item()
+                num_batches += 1
+                
+                # Limit evaluation for efficiency
+                if num_batches >= max_batches:
+                    break
+        
+        # Calculate overall metrics
+        avg_loss = total_loss / max(num_batches, 1)
+        
+        # Sort samples by loss for visualization
+        evaluation_samples.sort(key=lambda x: x['loss'])
+        
+        # Select samples for visualization
+        if len(evaluation_samples) >= 9:
+            # Top 3 (lowest loss), bottom 3 (highest loss), and 3 random from middle
+            top_3 = evaluation_samples[:3]
+            bottom_3 = evaluation_samples[-3:]
+            
+            # Random samples from middle portion
+            middle_samples = evaluation_samples[3:-3] if len(evaluation_samples) > 6 else []
+            if len(middle_samples) >= 3:
+                random_3 = random.sample(middle_samples, 3)
+            else:
+                random_3 = middle_samples[:3] if middle_samples else evaluation_samples[3:6]
+        else:
+            # Not enough samples, just use what we have
+            top_3 = evaluation_samples[:min(3, len(evaluation_samples))]
+            bottom_3 = evaluation_samples[-min(3, len(evaluation_samples)):] if len(evaluation_samples) > 3 else []
+            random_3 = []
+        
+        # Create visualization
+        self._create_evaluation_plot(top_3, bottom_3, random_3, save_dir, avg_loss)
+        
+        return {
+            'val_loss': avg_loss,
+            'num_samples_evaluated': len(evaluation_samples),
+            'best_loss': evaluation_samples[0]['loss'] if evaluation_samples else float('inf'),
+            'worst_loss': evaluation_samples[-1]['loss'] if evaluation_samples else float('inf')
+        }
+    
+    def _create_evaluation_plot(self, top_3, bottom_3, random_3, save_dir, avg_loss):
+        """Create and save evaluation visualization plot."""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        fig, axes = plt.subplots(3, 3, figsize=(18, 14))
+        fig.suptitle(f'Model Evaluation Results - Step {self.global_step} (Avg Loss: {avg_loss:.4f})', fontsize=16)
+        
+        sample_sets = [
+            (top_3, "Top 3 (Lowest Loss)", 'green'),
+            (bottom_3, "Bottom 3 (Highest Loss)", 'red'), 
+            (random_3, "Random 3 (Middle Range)", 'blue')
+        ]
+        
+        for row, (samples, title, color) in enumerate(sample_sets):
+            for col in range(3):
+                ax = axes[row, col]
+                
+                if col < len(samples):
+                    sample = samples[col]
+                    
+                    # Process and display image
+                    image = sample['image']
+                    if image.dim() == 4:  # Remove batch dimension if present
+                        image = image.squeeze(0)
+                    
+                    # Convert from tensor to displayable format
+                    if image.shape[0] == 3:  # CHW format
+                        image = image.permute(1, 2, 0)  # Convert to HWC
+                    
+                    # Normalize image for display
+                    image_np = image.cpu().numpy()
+                    if image_np.max() <= 1.0:
+                        image_np = (image_np * 255).astype(np.uint8)
+                    else:
+                        image_np = image_np.astype(np.uint8)
+                    
+                    # Handle grayscale or other formats
+                    if image_np.shape[-1] != 3:
+                        image_np = np.stack([image_np] * 3, axis=-1) if len(image_np.shape) == 2 else image_np
+                    
+                    ax.imshow(image_np)
+                    ax.axis('off')
+                    
+                    # Decode tokens to text
+                    try:
+                        predicted_text = self.tokenizer.decode(
+                            sample['predicted_tokens'], 
+                            skip_special_tokens=True
+                        ).strip()
+                        target_text = self.tokenizer.decode(
+                            sample['target_tokens'], 
+                            skip_special_tokens=True
+                        ).strip()
+                    except Exception as e:
+                        predicted_text = f"Decode error: {str(e)[:30]}..."
+                        target_text = "Decode error"
+                    
+                    # Truncate long text for display
+                    max_text_len = 40
+                    if len(predicted_text) > max_text_len:
+                        predicted_text = predicted_text[:max_text_len] + "..."
+                    if len(target_text) > max_text_len:
+                        target_text = target_text[:max_text_len] + "..."
+                    
+                    # Set title with loss and text
+                    title_text = f"Loss: {sample['loss']:.3f}\nTarget: {target_text}\nPred: {predicted_text}"
+                    ax.set_title(title_text, fontsize=9, color=color, weight='bold')
+                    
+                else:
+                    # Empty subplot
+                    ax.axis('off')
+                    ax.text(0.5, 0.5, 'No sample\navailable', 
+                           horizontalalignment='center', verticalalignment='center',
+                           transform=ax.transAxes, fontsize=12, alpha=0.5)
+        
+        # Add row labels
+        for row, (_, title, color) in enumerate(sample_sets):
+            fig.text(0.02, 0.83 - row * 0.28, title, rotation=90, 
+                    fontsize=14, weight='bold', color=color)
+        
+        plt.tight_layout()
+        
+        # Save plot
+        save_path = Path(save_dir) / f"evaluation_step_{self.global_step}.png"
+        plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close()
+        
+        print(f"📊 Evaluation plot saved to {save_path}")
+        
+        # Also log to wandb if enabled
+        if self.config.use_wandb:
+            try:
+                wandb.log({
+                    "eval_visualization": wandb.Image(str(save_path)),
+                    "global_step": self.global_step
+                })
+            except Exception as e:
+                print(f"⚠️ Failed to log evaluation plot to wandb: {e}")
+
     def train(self):
         """Main training loop."""
         print("🚀 Starting training...")
@@ -681,6 +934,7 @@ def parse_args():
                         help='Remote repository to download dataset from (e.g., "username/repo-name")')
     parser.add_argument('--force_download', action='store_true', 
                         help='Force download fresh data even if cache exists')
+    parser.add_argument('--sample_size', type=int, default=None, help='Limit the number of samples for training and validation')
     
     # Logging and checkpointing
     parser.add_argument('--use_wandb', action='store_true', default=True)
@@ -688,7 +942,7 @@ def parse_args():
     parser.add_argument('--run_name', type=str, default=None)
     parser.add_argument('--log_freq', type=int, default=50)
     parser.add_argument('--eval_freq', type=int, default=500)  # Evaluate every 500 steps
-    parser.add_argument('--max_eval_batches', type=int, default=100)  # Limit eval to save time
+    parser.add_argument('--max_eval_batches', type=int, default=5)  # Limit eval to save time
     parser.add_argument('--upload_checkpoints', action='store_true', default=True,
                         help='Upload checkpoints to wandb as artifacts for remote backup')
     parser.add_argument('--checkpoint_upload_freq', type=int, default=2000,
@@ -716,4 +970,4 @@ if __name__ == '__main__':
     
     # Create trainer and start training
     trainer = VisionLanguageTrainer(args)
-    trainer.train() 
+    trainer.train()
