@@ -312,28 +312,69 @@ class VisionLanguageTrainer:
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         
-        # Try to load optimizer state, but handle parameter group mismatch gracefully
-        try:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print("✅ Optimizer state loaded successfully")
-        except (ValueError, KeyError) as e:
-            print(f"⚠️  Optimizer state mismatch (likely due to parameter group changes): {e}")
-            print("🔄 Continuing with fresh optimizer state...")
-            # Reset optimizer state but keep the current parameter groups
-            pass
-        
-        # Try to load scheduler state
-        try:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            print("✅ Scheduler state loaded successfully")
-        except (ValueError, KeyError) as e:
-            print(f"⚠️  Scheduler state mismatch: {e}")
-            print("🔄 Continuing with fresh scheduler state...")
-            pass
+        # Load optimizer and scheduler state unless fresh_optimizer is requested
+        if hasattr(self.config, 'fresh_optimizer') and self.config.fresh_optimizer:
+            print("🔄 Using fresh optimizer state as requested")
+        else:
+            # Try to load optimizer state, but handle parameter group mismatch gracefully
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print("✅ Optimizer state loaded successfully")
+            except (ValueError, KeyError) as e:
+                print(f"⚠️  Optimizer state mismatch (likely due to parameter group changes): {e}")
+                print("🔄 Continuing with fresh optimizer state...")
+                # Reset optimizer state but keep the current parameter groups
+                pass
+            
+            # Try to load scheduler state
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print("✅ Scheduler state loaded successfully")
+            except (ValueError, KeyError) as e:
+                print(f"⚠️  Scheduler state mismatch: {e}")
+                print("🔄 Continuing with fresh scheduler state...")
+                pass
         
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
         self.best_val_loss = checkpoint['best_val_loss']
+        
+        # Handle learning rate override or fresh optimizer
+        need_scheduler_update = False
+        
+        # Override learning rate if requested
+        if hasattr(self.config, 'override_lr') and self.config.override_lr is not None:
+            old_lr = self.optimizer.param_groups[0]['lr']
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.config.override_lr
+            print(f"🔄 Learning rate overridden: {old_lr:.2e} → {self.config.override_lr:.2e}")
+            need_scheduler_update = True
+            
+        # If using fresh optimizer, recreate scheduler with current learning rate
+        if hasattr(self.config, 'fresh_optimizer') and self.config.fresh_optimizer:
+            need_scheduler_update = True
+            
+        # Update scheduler if needed
+        if need_scheduler_update:
+            # Calculate remaining steps for scheduler
+            steps_per_epoch = len(self.train_loader) // self.config.gradient_accumulation_steps
+            remaining_steps = (self.config.num_epochs - self.current_epoch) * steps_per_epoch - (self.global_step % steps_per_epoch)
+            
+            current_lr = self.optimizer.param_groups[0]['lr']
+            if self.config.lr_scheduler == 'cosine':
+                self.scheduler = CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=remaining_steps,
+                    eta_min=current_lr * 0.1
+                )
+            else:
+                self.scheduler = LinearLR(
+                    self.optimizer,
+                    start_factor=1.0,
+                    end_factor=0.1,
+                    total_iters=remaining_steps
+                )
+            print(f"🔄 Scheduler updated for remaining {remaining_steps} steps with LR {current_lr:.2e}")
         
         print(f"✅ Resumed from epoch {self.current_epoch}, step {self.global_step}")
         
@@ -713,6 +754,10 @@ def parse_args():
 
     # Resume training
     parser.add_argument('--resume_from_checkpoint', type=str, default=None)
+    parser.add_argument('--override_lr', type=float, default=None,
+                        help='Override learning rate when resuming from checkpoint')
+    parser.add_argument('--fresh_optimizer', action='store_true', default=False,
+                        help='Use fresh optimizer state when resuming (ignores saved optimizer state)')
     
     return parser.parse_args()
 
