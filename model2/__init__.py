@@ -5,12 +5,12 @@ This package contains the core components for training and inference
 of a vision-language model combining Qwen and CLIP.
 """
 
-from .model import QwenModel
-from .dataset import FlickrDataset, qwen_collate_fn
-from .inference import VisionLanguageInference
+from .model import QwenModelv2
+from model.dataset import FlickrDataset, qwen_collate_fn
+from model.inference import VisionLanguageInference
 
 __all__ = [
-    'QwenModel',
+    'QwenModelv2',
     'FlickrDataset', 
     'qwen_collate_fn',
     'VisionLanguageInference'
