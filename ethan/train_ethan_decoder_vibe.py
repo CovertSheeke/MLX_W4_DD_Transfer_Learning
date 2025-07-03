@@ -13,7 +13,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import random
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 load_dotenv(override=True)
 WANDB_ENTITY = os.getenv("WANDB_ENTITY", "")
@@ -31,51 +30,113 @@ class FlickrDataset(Dataset):
     
     def __getitem__(self, idx):
         item = self.data[idx]
-        
-        # Check if text_tokens exists, if not create it from text_embed
-        if 'text_tokens' not in item:
-            # This is an old dataset without text_tokens
-            # We need to regenerate tokens from the caption
-            from transformers import RobertaTokenizer
-            tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
-            tokens = tokenizer.encode(item['caption'], max_length=128, truncation=True, padding='max_length')
-            item['text_tokens'] = tokens.tolist()
-        
         # Convert to tensors
         item_tensors = convert_to_tensors(item)
         return item_tensors
 
 
-def prepare_input_target_sequences(batch, device, num_image_patches=50):
-    image_embeds = batch["image_embeds"].to(device)  
-    text_embeds = batch["text_embeds"].to(device)    
-    text_tokens = batch["text_tokens"].to(device)    
+def prepare_input_target_sequences(batch, device, num_image_patches=49):
+    """
+    Prepare input and target sequences for autoregressive training.
     
-    # Token IDs
+    Args:
+        batch: Batch from dataloader
+        device: torch device
+        num_image_patches: Number of image patches (assume CLIP ViT-B/32 = 7x7 = 49)
+    
+    Returns:
+        input_sequence: [batch_size, seq_len, hidden_dim] - image + text (no EOS)
+        target_tokens: [batch_size, text_seq_len] - text tokens (no BOS)
+        loss_mask: [batch_size, text_seq_len] - mask for loss calculation
+    """
+    image_embeds = batch["image_embeds"].to(device)  # [batch_size, num_patches, hidden_dim]
+    text_embeds = batch["text_embeds"].to(device)    # [batch_size, max_length, hidden_dim]
+    text_tokens = batch["text_tokens"].to(device)    # [batch_size, max_length]
+    
+    batch_size = image_embeds.shape[0]
+    
+    # Remove EOS token (id=2) from text embeddings and tokens for input
+    # Find EOS positions
     eos_token_id = 2
     bos_token_id = 0
     pad_token_id = 1
     
-    # Keep input text embeddings as-is (no modifications needed)
-    input_text_embeds = text_embeds
+    input_text_embeds = []
+    target_token_sequences = []
+    loss_masks = []
     
-    # Create target tokens for the entire sequence (image + text)
-    batch_size, text_seq_len = text_tokens.shape
-    target_tokens = torch.full((batch_size, 50 + text_seq_len), -100, device=device)  # Start with all ignore
+    for i in range(batch_size):
+        tokens = text_tokens[i]
+        embeds = text_embeds[i]
+        
+        # Find first EOS token position
+        eos_positions = (tokens == eos_token_id).nonzero(as_tuple=True)[0]
+        if len(eos_positions) > 0:
+            eos_pos = eos_positions[0].item()
+            # Input: remove EOS and everything after
+            input_text_embed = embeds[:eos_pos]
+            # Target: remove BOS, keep until EOS (inclusive)
+            target_tokens = tokens[1:eos_pos+1]
+        else:
+            # No EOS found, use full sequence
+            input_text_embed = embeds
+            target_tokens = tokens[1:]
+        
+        # Create loss mask (1 for real tokens, 0 for padding)
+        loss_mask = (target_tokens != pad_token_id).float()
+        
+        input_text_embeds.append(input_text_embed)
+        target_token_sequences.append(target_tokens)
+        loss_masks.append(loss_mask)
     
-    # Set text portion (shift text tokens left by 1 to remove BOS)
-    target_tokens[:, 50:] = text_tokens  # Keep original text tokens
-    target_tokens[:, 50] = -100  # Ignore the BOS token position
+    # Pad sequences to same length
+    max_text_len = max(len(seq) for seq in input_text_embeds)
     
-    # Set padding tokens to ignore
-    target_tokens[target_tokens == pad_token_id] = -100
+    # Pad input text embeddings
+    padded_input_embeds = []
+    padded_target_tokens = []
+    padded_loss_masks = []
+    
+    for i in range(batch_size):
+        input_embed = input_text_embeds[i]
+        target_tokens = target_token_sequences[i]
+        loss_mask = loss_masks[i]
+        
+        # Pad input embeddings
+        if len(input_embed) < max_text_len:
+            pad_len = max_text_len - len(input_embed)
+            zero_pad = torch.zeros(pad_len, input_embed.shape[1], device=device)
+            input_embed = torch.cat([input_embed, zero_pad], dim=0)
+        
+        # Pad target tokens
+        if len(target_tokens) < max_text_len:
+            pad_len = max_text_len - len(target_tokens)
+            token_pad = torch.full((pad_len,), pad_token_id, device=device)
+            target_tokens = torch.cat([target_tokens, token_pad], dim=0)
+        
+        # Pad loss mask
+        if len(loss_mask) < max_text_len:
+            pad_len = max_text_len - len(loss_mask)
+            mask_pad = torch.zeros(pad_len, device=device)
+            loss_mask = torch.cat([loss_mask, mask_pad], dim=0)
+        
+        padded_input_embeds.append(input_embed)
+        padded_target_tokens.append(target_tokens)
+        padded_loss_masks.append(loss_mask)
+    
+    # Stack into tensors
+    input_text_embeds = torch.stack(padded_input_embeds)  # [batch_size, max_text_len, hidden_dim]
+    target_tokens = torch.stack(padded_target_tokens)     # [batch_size, max_text_len]
+    loss_masks = torch.stack(padded_loss_masks)           # [batch_size, max_text_len]
     
     # Concatenate image and text embeddings
-    input_sequence = torch.cat([image_embeds, input_text_embeds], dim=1)
+    input_sequence = torch.cat([image_embeds, input_text_embeds], dim=1)  # [batch_size, num_patches + max_text_len, hidden_dim]
     
-    return input_sequence, target_tokens
+    return input_sequence, target_tokens, loss_masks
+
 
 def train_one_epoch(model, dataloader, optimizer, criterion, device, token_converter):
+    """Train the model for one epoch."""
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -86,30 +147,43 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, token_conve
         optimizer.zero_grad()
         
         # Prepare sequences
-        input_sequence, target_tokens = prepare_input_target_sequences(batch, device)
+        input_sequence, target_tokens, loss_masks = prepare_input_target_sequences(batch, device)
         
         # Forward pass
         logits = model(input_sequence)  # [batch_size, seq_len, vocab_size]
         
-        # Reshape for loss calculation
-        batch_size, seq_len, vocab_size = logits.shape
-        logits_flat = logits.reshape(-1, vocab_size)
-        target_tokens_flat = target_tokens.reshape(-1)
+        # Get text portion of logits (skip image patches)
+        num_image_patches = 49  # CLIP ViT-B/32
+        text_logits = logits[:, num_image_patches:, :]  # [batch_size, text_seq_len, vocab_size]
         
-        # Calculate loss (automatically ignores -100 tokens)
-        loss = criterion(logits_flat, target_tokens_flat)
+        # Reshape for loss calculation
+        batch_size, seq_len, vocab_size = text_logits.shape
+        text_logits_flat = text_logits.reshape(-1, vocab_size)  # [batch_size * seq_len, vocab_size]
+        target_tokens_flat = target_tokens.reshape(-1)  # [batch_size * seq_len]
+        loss_masks_flat = loss_masks.reshape(-1)  # [batch_size * seq_len]
+        
+        # Calculate loss
+        loss = criterion(text_logits_flat, target_tokens_flat)
+        
+        # Apply mask to loss
+        masked_loss = loss * loss_masks_flat
+        final_loss = masked_loss.sum() / loss_masks_flat.sum()
         
         # Backward pass
-        loss.backward()
+        final_loss.backward()
         optimizer.step()
         
-        total_loss += loss.item()
+        total_loss += final_loss.item()
         num_batches += 1
         
-        progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
-        wandb.log({"batch_loss": loss.item()})
+        # Update progress bar
+        progress_bar.set_postfix({"Loss": f"{final_loss.item():.4f}"})
+        
+        # Log to wandb
+        wandb.log({"batch_loss": final_loss.item()})
     
-    return total_loss / num_batches
+    avg_loss = total_loss / num_batches
+    return avg_loss
 
 
 def evaluate_model(model, dataloader, device, token_converter, save_dir="eval_results"):
@@ -124,38 +198,39 @@ def evaluate_model(model, dataloader, device, token_converter, save_dir="eval_re
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             # Prepare sequences
-            input_sequence, target_tokens = prepare_input_target_sequences(batch, device)
+            input_sequence, target_tokens, loss_masks = prepare_input_target_sequences(batch, device)
             
             # Forward pass
             logits = model(input_sequence)
             
-            # Use full sequence for evaluation (consistent with training)
-            criterion = nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
-            batch_size, seq_len, vocab_size = logits.shape
+            # Get text portion
+            num_image_patches = 49
+            text_logits = logits[:, num_image_patches:, :]
+            
+            # Calculate loss for each sample in batch
+            criterion = nn.CrossEntropyLoss(reduction='none')
+            batch_size, seq_len, vocab_size = text_logits.shape
             
             for i in range(batch_size):
-                sample_logits = logits[i]  # [full_seq_len, vocab_size] 
-                sample_targets = target_tokens[i]  # [full_seq_len]
+                sample_logits = text_logits[i]  # [seq_len, vocab_size]
+                sample_targets = target_tokens[i]  # [seq_len]
+                sample_mask = loss_masks[i]  # [seq_len]
                 
-                # Calculate loss using full sequence
-                sample_logits_flat = sample_logits.reshape(-1, sample_logits.shape[-1])
-                sample_targets_flat = sample_targets.reshape(-1)
-                loss = criterion(sample_logits_flat, sample_targets_flat)
-                
-                # Get text portion for prediction display
-                num_image_patches = 50
-                text_logits = sample_logits[num_image_patches:]  # Text portion only
+                # Calculate loss
+                loss = criterion(sample_logits, sample_targets)
+                masked_loss = (loss * sample_mask).sum() / sample_mask.sum()
                 
                 # Store sample info
                 evaluation_samples.append({
-                    'loss': loss.mean().item(),  # Average loss for this sample
+                    'loss': masked_loss.item(),
                     'image': batch['images'][i],
                     'caption': batch['captions'][i],
-                    'predicted_tokens': torch.argmax(text_logits, dim=-1),
-                    'target_tokens': sample_targets[num_image_patches:]  # Text portion only
+                    'predicted_tokens': torch.argmax(sample_logits, dim=-1),
+                    'target_tokens': sample_targets,
+                    'mask': sample_mask
                 })
                 
-                all_losses.append(loss.mean().item())
+                all_losses.append(masked_loss.item())
     
     # Sort by loss for top/bottom analysis
     evaluation_samples.sort(key=lambda x: x['loss'])
@@ -163,12 +238,7 @@ def evaluate_model(model, dataloader, device, token_converter, save_dir="eval_re
     # Get top 3, bottom 3, and 3 random samples
     top_3 = evaluation_samples[:3]
     bottom_3 = evaluation_samples[-3:]
-    
-    # Fixed:
-    if len(evaluation_samples) > 6:
-        random_3 = random.sample(evaluation_samples[3:-3], min(3, len(evaluation_samples) - 6))
-    else:
-        random_3 = evaluation_samples[:min(3, len(evaluation_samples))]
+    random_3 = random.sample(evaluation_samples[3:-3], min(3, len(evaluation_samples) - 6))
     
     # Create visualizations
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
@@ -185,18 +255,7 @@ def evaluate_model(model, dataloader, device, token_converter, save_dir="eval_re
             ax = axes[row, col]
             
             # Display image
-            if isinstance(sample['image'], torch.Tensor):
-                image = sample['image'].cpu().numpy()
-                # Handle different tensor formats
-                if image.shape[0] == 3:  # Channel first
-                    image = image.transpose(1, 2, 0)
-                # Normalize if needed
-                if image.max() <= 1.0:
-                    image = (image * 255).astype(np.uint8)
-            else:
-                image = sample['image']
-
-            ax.imshow(image)
+            ax.imshow(sample['image'])
             ax.axis('off')
             
             # Convert tokens to text
@@ -204,10 +263,12 @@ def evaluate_model(model, dataloader, device, token_converter, save_dir="eval_re
             
             # Convert predicted tokens to text (only non-padded tokens)
             pred_tokens = sample['predicted_tokens']
+            mask = sample['mask']
+            valid_pred_tokens = pred_tokens[mask == 1]
             
             try:
                 predicted_caption = token_converter.tokens_to_text_direct(
-                    pred_tokens, skip_special_tokens=True
+                    valid_pred_tokens, skip_special_tokens=True
                 )
             except:
                 predicted_caption = "Error in decoding"
@@ -259,8 +320,7 @@ def train(model, train_dataset, val_dataset, config, device):
     
     # Initialize optimizer and loss function
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
-    # To this:
-    criterion = nn.CrossEntropyLoss(reduction='mean', ignore_index=-100)
+    criterion = nn.CrossEntropyLoss(reduction='none')
     
     print(f"Starting training for {config.num_epochs} epoch(s)...")
     print(f"Training samples: {len(train_dataset)}")
@@ -307,12 +367,35 @@ def main():
     temp_converter.load_tokenizer()
     vocab_size = temp_converter.tokenizer.vocab_size
     
+    wandb.init(
+        project=WANDB_PROJECT or "ethan_decoder_training", 
+        entity=WANDB_ENTITY,
+        config={
+            "seq_len": 128,
+            "dim_attn_in": 768,  # RoBERTa hidden size
+            "num_decoder_blocks": 6,
+            "dim_ffn": 2048,
+            "num_msAttnHeads": 8,
+            "dim_V": 64,
+            "dim_KQ": 64,
+            "dim_logits": vocab_size,  # Use actual vocabulary size
+            "dropout_rate": 0.1,
+            "batch_size": 4,  # Reduced for memory
+            "num_epochs": 1,
+            "learning_rate": 0.0001
+        }
+    )
 
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    
+    # Create the model
+    model = DecoderFull(wandb.config).to(device)
+    print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
+
     # Load pre-embedded dataset
-    data_path = 'flickr30k_processed_splits_current.pkl'  # Use the main file, not test
+    data_path = 'flickr30k_processed_splits_test.pkl'
     if not os.path.exists(data_path):
         data_path = os.path.join('..', 'flickr30k_processed_splits.pkl')
     
@@ -327,38 +410,6 @@ def main():
     train_data = raw_dataset.get('train', [])
     validation_data = raw_dataset.get('validation', [])
     test_data = raw_dataset.get('test', [])
-
-        # Get text token length from first item (assuming all are same length)
-    sample_item = train_data[0]
-    if 'text_tokens' in sample_item:
-        max_text_length = len(sample_item['text_tokens'])
-    else:
-        max_text_length = 60  # fallback
-    print(f"Text token length: {max_text_length}")
-    calculated_seq_len = 50 + max_text_length   # 49 image patches + text tokens
-    
-    wandb.init(
-        project=WANDB_PROJECT or "ethan_decoder_training", 
-        entity=WANDB_ENTITY,
-        config={
-            "seq_len": calculated_seq_len,  # Instead of 110
-            "dim_attn_in": 768,  # RoBERTa hidden size
-            "num_decoder_blocks": 1,
-            "dim_ffn": 2048,
-            "num_msAttnHeads": 1,
-            "dim_V": 64,
-            "dim_KQ": 64,
-            "dim_logits": vocab_size,  # Use actual vocabulary size
-            "dropout_rate": 0.1,
-            "batch_size": 1,  # Reduced for memory
-            "num_epochs": 1,
-            "learning_rate": 0.0001
-        }
-    )
-    # Create the model
-    model = DecoderFull(wandb.config).to(device)
-    print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
-
 
     # Check if the splits are present
     if not train_data:
