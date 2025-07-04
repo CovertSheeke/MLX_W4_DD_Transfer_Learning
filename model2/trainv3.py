@@ -284,13 +284,13 @@ class VisionLanguageTrainer:
         }
 
         # (1) Save / overwrite the latest checkpoint every time this is called
-        latest_path = self.checkpoint_dir / "latest.pt"
+        latest_path = self.checkpoint_dir / "latestv3.pt"
         torch.save(state, latest_path)
         print(f"💾 Saved latest checkpoint → {latest_path}")
 
         # (2) If this is the best model so far, save / overwrite best checkpoint
         if is_best:
-            best_path = self.checkpoint_dir / "best.pt"
+            best_path = self.checkpoint_dir / "bestv3.pt"
             torch.save(state, best_path)
             print(f"🏆 New best model saved → {best_path}")
 
@@ -299,8 +299,8 @@ class VisionLanguageTrainer:
             # Always push a new best; push latest periodically
             should_upload = is_best or (self.global_step % self.config.checkpoint_upload_freq == 0)
             if should_upload:
-                target_path = (self.checkpoint_dir / "best.pt") if is_best else latest_path
-                artifact_name = "best" if is_best else "latest"
+                target_path = (self.checkpoint_dir / "bestv3.pt") if is_best else latest_path
+                artifact_name = "best_v3" if is_best else "latest_v3"
                 self.upload_checkpoint_to_wandb(target_path, artifact_name, is_best=is_best)
         
     def upload_checkpoint_to_wandb(self, checkpoint_path, artifact_name, is_best=False):
@@ -309,7 +309,7 @@ class VisionLanguageTrainer:
             print(f"☁️  Uploading {'best model' if is_best else 'checkpoint'} to wandb...")
             
             # Create artifact
-            artifact_type = "best_model" if is_best else "checkpoint"
+            artifact_type = "best_model_v3" if is_best else "checkpoint_v3"
             artifact = wandb.Artifact(
                 name=artifact_name,
                 type=artifact_type,
