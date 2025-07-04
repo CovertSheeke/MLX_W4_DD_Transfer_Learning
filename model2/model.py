@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3Model, CLIPVisionModel, GPT2LMHeadModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, CLIPVisionModel, GPT2LMHeadModel, Qwen3Model
 from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings, CLIPVisionTransformer
 from transformers.utils import can_return_tuple
 import torch
@@ -76,10 +76,7 @@ class QwenModelv2(nn.Module):
         
         # Add projection layer to match dimensions
         self.image_projection = nn.Linear(1024, self.qwen.config.hidden_size)  # CLIP: 1024 -> Qwen: varies
-        
-        # Add language modeling head to generate vocabulary logits
         self.lm_head = nn.Linear(self.qwen.config.hidden_size, self.qwen.config.vocab_size, bias=False)
-        
 
     def forward(self, image_data, input_ids, attention_mask):
         batch_size = input_ids.shape[0]
@@ -114,3 +111,45 @@ class QwenModelv2(nn.Module):
         logits = self.lm_head(hidden_states)  # [batch, seq_len, vocab_size]
         
         return logits
+
+class QwenModelv3(nn.Module):
+    def __init__(self, model_name="Qwen/Qwen3-0.6B-Base"):
+        super().__init__()
+        self.qwen = AutoModelForCausalLM.from_pretrained(model_name)
+        
+        self.image_encoder = ClipModule.from_pretrained("openai/clip-vit-large-patch14")
+        
+        # Add projection layer to match dimensions
+        self.image_projection = nn.Linear(1024, self.qwen.config.hidden_size)  # CLIP: 1024 -> Qwen: varies
+ 
+
+    def forward(self, image_data, input_ids, attention_mask):
+        batch_size = input_ids.shape[0]
+        
+        # Process image 
+        encoded_image_embeddings = self.image_encoder(image_data).last_hidden_state  # [batch, 257, 1024]
+        image_tokens = self.image_projection(encoded_image_embeddings)  # [batch, 257, hidden_size]
+        
+        # Get text embeddings from Qwen base model
+        text_embeddings = self.qwen.model.embed_tokens(input_ids)  # [batch, seq_len, hidden_size]
+        
+        # Concatenate image and text embeddings
+        combined_embeddings = torch.cat([image_tokens, text_embeddings], dim=1)
+        
+        # Create combined attention mask
+        # Create image attention mask efficiently 
+        image_attention = torch.ones(
+            batch_size, image_tokens.shape[1], 
+            dtype=attention_mask.dtype, 
+            device=attention_mask.device
+        )
+        combined_attention_mask = torch.cat([image_attention, attention_mask], dim=1)
+        
+        # Forward through Qwen CausalLM with combined inputs - this automatically applies lm_head
+        outputs = self.qwen(
+            inputs_embeds=combined_embeddings,
+            attention_mask=combined_attention_mask
+        )
+        
+        # AutoModelForCausalLM already applies lm_head internally and returns logits
+        return outputs.logits
