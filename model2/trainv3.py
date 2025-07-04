@@ -242,8 +242,8 @@ class VisionLanguageTrainer:
                 total_iters=self.total_steps
             )
         
-        # Loss function (cross-entropy for language modeling)
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
+        # Loss function (cross-entropy for language modeling with label smoothing)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
         
         print(f"🎯 Total training steps: {self.total_steps}")
         print(f"📈 Learning rate scheduler: {self.config.lr_scheduler}")
