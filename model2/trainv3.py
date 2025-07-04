@@ -758,7 +758,7 @@ def parse_args():
     parser.add_argument('--num_epochs', type=int, default=3)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--eval_batch_size', type=int, default=8)
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=2)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=4)
     parser.add_argument('--learning_rate', type=float, default=2e-5)
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
